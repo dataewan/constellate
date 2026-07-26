@@ -83,8 +83,39 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- The scratchpad: an ordered working set of note paths. Standalone
+            -- (no FK to notes) so re-indexing a note — which deletes and
+            -- re-inserts its row — does not drop it from the scratchpad.
+            CREATE TABLE IF NOT EXISTS scratchpad (
+                note_path TEXT PRIMARY KEY,
+                position  INTEGER NOT NULL
+            );
             "#,
         )?;
+        Ok(())
+    }
+
+    /// The scratchpad note paths, in order.
+    pub fn load_scratchpad(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT note_path FROM scratchpad ORDER BY position")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Replace the scratchpad with `paths`, preserving their order.
+    pub fn save_scratchpad(&mut self, paths: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM scratchpad", [])?;
+        for (i, path) in paths.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO scratchpad (note_path, position) VALUES (?1, ?2)",
+                params![path, i as i64],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

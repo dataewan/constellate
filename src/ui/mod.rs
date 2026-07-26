@@ -5,9 +5,11 @@ pub use app::{Action, App, Focus};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+
+pub use app::LinkPrompt;
 
 /// Render the full three-pane layout plus a footer.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -29,10 +31,55 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Color::Cyan
     };
 
+    // The center column stacks the preview over the scratchpad.
+    let [preview_area, scratch_area] =
+        Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(center);
+
     render_notes_list(f, app, left, accent);
-    render_preview(f, app, center, accent);
+    render_preview(f, app, preview_area, accent);
+    render_scratchpad(f, app, scratch_area, accent);
     render_related(f, app, right, accent);
     render_footer(f, app, footer, accent);
+
+    // The linking modal overlays everything while active.
+    if let Some(prompt) = app.linking_prompt() {
+        render_link_modal(f, &prompt);
+    }
+}
+
+/// A `Rect` of the given size, centered within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
+fn render_link_modal(f: &mut Frame, prompt: &LinkPrompt) {
+    let area = centered_rect(62, 11, f.area());
+    f.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(format!("Pair {}/{} — link these notes?", prompt.index, prompt.total)).bold(),
+        Line::from(""),
+        Line::from(vec![Span::from("A: ").dim(), Span::raw(prompt.a_name.clone())]),
+        Line::from(vec![Span::from("B: ").dim(), Span::raw(prompt.b_name.clone())]),
+        Line::from(""),
+        Line::from("[1] A → B      [2] B → A      [3] both"),
+        Line::from("[4] skip       [Esc] cancel"),
+    ];
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Link notes ")
+                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(modal, area);
 }
 
 fn selection_highlight() -> Style {
@@ -120,6 +167,43 @@ fn render_related(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
     f.render_stateful_widget(list, area, &mut app.related_state);
 }
 
+fn render_scratchpad(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
+    // Two columns: the file list on the left, the command menu on the right.
+    let [files_area, commands_area] =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
+
+    let focused = app.focus == Focus::Scratchpad;
+    let files = app.scratchpad_files();
+    let title = format!(" 4 Scratchpad ({}) ", files.len());
+
+    if files.is_empty() {
+        let empty = Paragraph::new("Empty — press a to add.".dim())
+            .block(pane_block(title, focused, accent))
+            .wrap(Wrap { trim: true });
+        f.render_widget(empty, files_area);
+    } else {
+        let items: Vec<ListItem> = files.into_iter().map(ListItem::new).collect();
+        let list = List::new(items)
+            .block(pane_block(title, focused, accent))
+            .highlight_style(selection_highlight())
+            .highlight_symbol("› ");
+        f.render_stateful_widget(list, files_area, &mut app.scratchpad_state);
+    }
+
+    render_scratchpad_commands(f, commands_area, accent);
+}
+
+fn render_scratchpad_commands(f: &mut Frame, area: Rect, accent: Color) {
+    let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::from(vec![Span::styled("(l)", key), Span::raw(" Link notes")]),
+        Line::from(vec![Span::styled("(s)", key), Span::raw(" Send to LLM")]),
+    ];
+    let commands = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Commands "));
+    f.render_widget(commands, area);
+}
+
 fn render_footer(f: &mut Frame, app: &App, area: Rect, accent: Color) {
     // A transient status message takes precedence over the key hints.
     if let Some(status) = &app.status {
@@ -140,11 +224,12 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect, accent: Color) {
         Focus::Notes => "j/k: select",
         Focus::Preview => "j/k: scroll",
         Focus::Related => "j/k: select   Enter: jump",
+        Focus::Scratchpad => "j/k: select   x: remove",
     };
     let text = if !app.query.is_empty() {
         format!("filtered: \"{}\"   Esc: clear   {move_hint}   /: search   q: quit", app.query)
     } else {
-        format!("1/2/3·Tab: panes   {move_hint}   e: edit   y: copy   /: search   q: quit")
+        format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   y: copy   /: search   q: quit")
     };
     f.render_widget(Paragraph::new(Line::from(text).dim()), area);
 }

@@ -109,6 +109,17 @@ impl RelatedIndex {
         RelatedIndex { entries, by_path }
     }
 
+    /// Whether notes `a` and `b` are directly linked in either direction.
+    pub fn are_linked(&self, a: &str, b: &str) -> bool {
+        let links_to = |from: &str, to: &str| {
+            self.by_path
+                .get(from)
+                .map(|&i| self.entries[i].out_paths.contains(to))
+                .unwrap_or(false)
+        };
+        links_to(a, b) || links_to(b, a)
+    }
+
     /// Rank notes related to `path`, most relevant first, capped at `limit`.
     pub fn related(&self, path: &str, limit: usize) -> Vec<RelatedNote> {
         let Some(&i) = self.by_path.get(path) else {

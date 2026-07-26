@@ -7,6 +7,7 @@ use ratatui::widgets::ListState;
 use crate::config::RefFormat;
 use crate::db::store::NoteRow;
 use crate::embed::SemanticIndex;
+use crate::linking;
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::ui::markdown;
 
@@ -16,6 +17,7 @@ pub enum Focus {
     Notes,
     Preview,
     Related,
+    Scratchpad,
 }
 
 impl Focus {
@@ -23,15 +25,17 @@ impl Focus {
         match self {
             Focus::Notes => Focus::Preview,
             Focus::Preview => Focus::Related,
-            Focus::Related => Focus::Notes,
+            Focus::Related => Focus::Scratchpad,
+            Focus::Scratchpad => Focus::Notes,
         }
     }
 
     fn prev(self) -> Focus {
         match self {
-            Focus::Notes => Focus::Related,
+            Focus::Notes => Focus::Scratchpad,
             Focus::Preview => Focus::Notes,
             Focus::Related => Focus::Preview,
+            Focus::Scratchpad => Focus::Related,
         }
     }
 }
@@ -42,6 +46,37 @@ pub enum Action {
     Quit,
     OpenEditor(PathBuf),
     Yank(String),
+    /// The scratchpad changed and should be persisted.
+    ScratchpadChanged,
+    /// These files were modified on disk and should be re-indexed.
+    ReindexPaths(Vec<String>),
+}
+
+/// A candidate pair of notes to offer a link between, during the linking flow.
+#[derive(Clone)]
+struct LinkPair {
+    a_path: String,
+    a_title: String,
+    a_name: String,
+    b_path: String,
+    b_title: String,
+    b_name: String,
+}
+
+/// State of an in-progress "link the scratchpad notes" session.
+struct LinkingState {
+    pairs: Vec<LinkPair>,
+    index: usize,
+    created: usize,
+    modified: Vec<String>,
+}
+
+/// Read-only snapshot of the current link prompt, for rendering the modal.
+pub struct LinkPrompt {
+    pub a_name: String,
+    pub b_name: String,
+    pub index: usize,
+    pub total: usize,
 }
 
 /// All browsing/search state for the TUI.
@@ -79,12 +114,25 @@ pub struct App {
     pub list_state: ListState,
     /// Selection state for the related-notes list widget.
     pub related_state: ListState,
+    /// The scratchpad: an ordered working set of note paths.
+    scratchpad: Vec<String>,
+    /// Selection within the scratchpad pane.
+    scratchpad_selected: usize,
+    /// Selection state for the scratchpad list widget.
+    pub scratchpad_state: ListState,
+    /// In-progress link-the-scratchpad session, if any.
+    linking: Option<LinkingState>,
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
 
 impl App {
-    pub fn new(vault: PathBuf, ref_format: RefFormat, notes: Vec<NoteRow>) -> Self {
+    pub fn new(
+        vault: PathBuf,
+        ref_format: RefFormat,
+        notes: Vec<NoteRow>,
+        scratchpad: Vec<String>,
+    ) -> Self {
         let related_index = RelatedIndex::build(&notes);
         let mut app = App {
             vault,
@@ -103,10 +151,15 @@ impl App {
             query: String::new(),
             list_state: ListState::default(),
             related_state: ListState::default(),
+            scratchpad,
+            scratchpad_selected: 0,
+            scratchpad_state: ListState::default(),
+            linking: None,
             status: None,
         };
         app.refilter();
         app.select_note_changed();
+        app.sync_scratchpad_state();
         app
     }
 
@@ -141,14 +194,18 @@ impl App {
     pub fn visible_files(&self) -> Vec<String> {
         self.filtered
             .iter()
-            .map(|&i| {
-                let rel = self.relative_path(&self.notes[i].path);
-                match rel.rsplit_once('.') {
-                    Some((stem, _ext)) => stem.to_string(),
-                    None => rel,
-                }
-            })
+            .map(|&i| self.display_filename(&self.notes[i].path))
             .collect()
+    }
+
+    /// A note's vault-relative filename with the extension stripped, for display
+    /// in the notes list and scratchpad.
+    fn display_filename(&self, path: &str) -> String {
+        let rel = self.relative_path(path);
+        match rel.rsplit_once('.') {
+            Some((stem, _ext)) => stem.to_string(),
+            None => rel,
+        }
     }
 
     /// Related notes for the current selection.
@@ -161,6 +218,20 @@ impl App {
         &self.preview
     }
 
+    /// The scratchpad note paths, in order (for persistence).
+    pub fn scratchpad_paths(&self) -> &[String] {
+        &self.scratchpad
+    }
+
+    /// Display labels for the scratchpad entries: the filename, matching the
+    /// notes list (never the derived title/heading).
+    pub fn scratchpad_files(&self) -> Vec<String> {
+        self.scratchpad
+            .iter()
+            .map(|path| self.display_filename(path))
+            .collect()
+    }
+
     /// The note anchoring the view: the Notes-pane selection. The related list
     /// is always computed from this note, so navigating the Related pane does
     /// not disturb it.
@@ -169,15 +240,21 @@ impl App {
     }
 
     /// The note the preview pane shows and that edit/yank act on: the
-    /// highlighted related note while the Related pane has focus, otherwise the
-    /// anchor. This lets Related-pane navigation preview notes without moving
-    /// the anchor or the related list.
+    /// highlighted note when the Related or Scratchpad pane has focus, otherwise
+    /// the anchor. This lets navigating those panes preview notes without moving
+    /// the anchor.
     pub fn active_note(&self) -> Option<&NoteRow> {
-        if self.focus == Focus::Related {
-            if let Some(related) = self.related.get(self.related_selected) {
-                if let Some(note) = self.notes.iter().find(|n| n.path == related.path) {
-                    return Some(note);
-                }
+        let highlighted = match self.focus {
+            Focus::Related => self.related.get(self.related_selected).map(|r| r.path.as_str()),
+            Focus::Scratchpad => self
+                .scratchpad
+                .get(self.scratchpad_selected)
+                .map(|p| p.as_str()),
+            _ => None,
+        };
+        if let Some(path) = highlighted {
+            if let Some(note) = self.notes.iter().find(|n| n.path == path) {
+                return Some(note);
             }
         }
         self.anchor_note()
@@ -221,6 +298,11 @@ impl App {
         // Any deliberate key clears a lingering status message.
         self.status = None;
 
+        // The linking modal captures all input while active.
+        if self.linking.is_some() {
+            return self.handle_linking_key(key);
+        }
+
         if self.searching {
             match key.code {
                 // First Esc leaves the input but keeps the filter; a second Esc
@@ -255,6 +337,7 @@ impl App {
             KeyCode::Char('1') => self.set_focus(Focus::Notes),
             KeyCode::Char('2') => self.set_focus(Focus::Preview),
             KeyCode::Char('3') => self.set_focus(Focus::Related),
+            KeyCode::Char('4') => self.set_focus(Focus::Scratchpad),
             KeyCode::Tab => self.set_focus(self.focus.next()),
             KeyCode::BackTab => self.set_focus(self.focus.prev()),
             KeyCode::Char('/') => {
@@ -264,6 +347,11 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::Enter => return self.on_enter(),
+            KeyCode::Char('a') => return self.add_to_scratchpad(),
+            KeyCode::Char('x') if self.focus == Focus::Scratchpad => {
+                return self.remove_from_scratchpad();
+            }
+            KeyCode::Char('l') => self.start_linking(),
             KeyCode::Char('y') => {
                 if let Some(reference) = self.current_reference() {
                     return Action::Yank(reference);
@@ -277,6 +365,171 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// Add the active note to the scratchpad (ignoring duplicates).
+    fn add_to_scratchpad(&mut self) -> Action {
+        let Some(path) = self.active_note().map(|n| n.path.clone()) else {
+            return Action::None;
+        };
+        let name = self.display_filename(&path);
+        if self.scratchpad.contains(&path) {
+            self.set_status(format!("Already in scratchpad: {name}"));
+            return Action::None;
+        }
+        self.scratchpad.push(path);
+        self.scratchpad_selected = self.scratchpad.len() - 1;
+        self.sync_scratchpad_state();
+        self.set_status(format!("Added to scratchpad: {name}"));
+        Action::ScratchpadChanged
+    }
+
+    /// Remove the highlighted scratchpad entry.
+    fn remove_from_scratchpad(&mut self) -> Action {
+        if self.scratchpad.is_empty() {
+            return Action::None;
+        }
+        let removed = self.scratchpad.remove(self.scratchpad_selected);
+        self.sync_scratchpad_state();
+        // The highlighted entry changed (or the list emptied); refresh preview.
+        self.rebuild_preview();
+        let name = self.display_filename(&removed);
+        self.set_status(format!("Removed from scratchpad: {name}"));
+        Action::ScratchpadChanged
+    }
+
+    /// A read-only snapshot of the current link prompt, for rendering the modal.
+    pub fn linking_prompt(&self) -> Option<LinkPrompt> {
+        self.linking.as_ref().map(|state| {
+            let pair = &state.pairs[state.index];
+            LinkPrompt {
+                a_name: pair.a_name.clone(),
+                b_name: pair.b_name.clone(),
+                index: state.index + 1,
+                total: state.pairs.len(),
+            }
+        })
+    }
+
+    /// Begin linking the scratchpad notes: build the queue of not-yet-linked
+    /// pairs and open the modal on the first one.
+    fn start_linking(&mut self) {
+        if self.scratchpad.len() < 2 {
+            self.set_status("Add at least 2 notes to the scratchpad to link them.");
+            return;
+        }
+
+        // Resolve each scratchpad path to (path, link-text title, display name),
+        // dropping any that are no longer indexed.
+        let notes: Vec<(String, String, String)> = self
+            .scratchpad
+            .iter()
+            .filter_map(|path| {
+                self.notes
+                    .iter()
+                    .find(|n| &n.path == path)
+                    .map(|n| (n.path.clone(), n.title.clone(), self.display_filename(path)))
+            })
+            .collect();
+
+        let mut pairs = Vec::new();
+        for i in 0..notes.len() {
+            for j in (i + 1)..notes.len() {
+                let (a_path, a_title, a_name) = &notes[i];
+                let (b_path, b_title, b_name) = &notes[j];
+                if !self.related_index.are_linked(a_path, b_path) {
+                    pairs.push(LinkPair {
+                        a_path: a_path.clone(),
+                        a_title: a_title.clone(),
+                        a_name: a_name.clone(),
+                        b_path: b_path.clone(),
+                        b_title: b_title.clone(),
+                        b_name: b_name.clone(),
+                    });
+                }
+            }
+        }
+
+        if pairs.is_empty() {
+            self.set_status("All scratchpad notes are already linked.");
+            return;
+        }
+
+        let total = pairs.len();
+        self.linking = Some(LinkingState {
+            pairs,
+            index: 0,
+            created: 0,
+            modified: Vec::new(),
+        });
+        self.set_status(format!("Linking: {total} pair(s) to review"));
+    }
+
+    /// Handle a key while the linking modal is open.
+    fn handle_linking_key(&mut self, key: KeyEvent) -> Action {
+        // (a→b, b→a) directions to create for this pair; None = ignore key.
+        let directions = match key.code {
+            KeyCode::Char('1') => Some((true, false)),
+            KeyCode::Char('2') => Some((false, true)),
+            KeyCode::Char('3') => Some((true, true)),
+            KeyCode::Char('4') | KeyCode::Char('n') => Some((false, false)),
+            KeyCode::Esc => return self.finish_linking(true),
+            _ => None,
+        };
+        let Some((a_to_b, b_to_a)) = directions else {
+            return Action::None;
+        };
+
+        let Some(pair) = self.linking.as_ref().map(|s| s.pairs[s.index].clone()) else {
+            return Action::None;
+        };
+
+        let mut modified = Vec::new();
+        if a_to_b && self.apply_link(&pair.a_path, &pair.b_path, &pair.b_title) {
+            modified.push(pair.a_path.clone());
+        }
+        if b_to_a && self.apply_link(&pair.b_path, &pair.a_path, &pair.a_title) {
+            modified.push(pair.b_path.clone());
+        }
+
+        if let Some(state) = self.linking.as_mut() {
+            state.created += modified.len();
+            state.modified.extend(modified);
+            state.index += 1;
+            if state.index >= state.pairs.len() {
+                return self.finish_linking(false);
+            }
+        }
+        Action::None
+    }
+
+    /// Write one link; report failure via the status line. Returns success.
+    fn apply_link(&mut self, from: &str, to: &str, to_title: &str) -> bool {
+        match linking::append_link(Path::new(from), Path::new(to), to_title) {
+            Ok(()) => true,
+            Err(err) => {
+                self.set_status(format!("Link failed: {err}"));
+                false
+            }
+        }
+    }
+
+    /// End the linking session, reporting a summary and requesting re-index of
+    /// any modified files.
+    fn finish_linking(&mut self, cancelled: bool) -> Action {
+        let Some(state) = self.linking.take() else {
+            return Action::None;
+        };
+        let verb = if cancelled { "cancelled" } else { "complete" };
+        self.set_status(format!(
+            "Linking {verb} — {} link(s) created",
+            state.created
+        ));
+        if state.modified.is_empty() {
+            Action::None
+        } else {
+            Action::ReindexPaths(state.modified)
+        }
     }
 
     /// Enter does something different depending on the focused pane.
@@ -311,6 +564,7 @@ impl App {
             Focus::Notes => self.move_selection(1),
             Focus::Preview => self.scroll_preview(1),
             Focus::Related => self.move_related(1),
+            Focus::Scratchpad => self.move_scratchpad(1),
         }
     }
 
@@ -319,7 +573,20 @@ impl App {
             Focus::Notes => self.move_selection(-1),
             Focus::Preview => self.scroll_preview(-1),
             Focus::Related => self.move_related(-1),
+            Focus::Scratchpad => self.move_scratchpad(-1),
         }
+    }
+
+    fn move_scratchpad(&mut self, delta: isize) {
+        if self.scratchpad.is_empty() {
+            return;
+        }
+        let len = self.scratchpad.len() as isize;
+        self.scratchpad_selected =
+            (self.scratchpad_selected as isize + delta).rem_euclid(len) as usize;
+        self.scratchpad_state.select(Some(self.scratchpad_selected));
+        // Preview the highlighted scratchpad note (focus is Scratchpad here).
+        self.rebuild_preview();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -451,6 +718,18 @@ impl App {
                 self.related_selected = self.related.len() - 1;
             }
             self.related_state.select(Some(self.related_selected));
+        }
+    }
+
+    fn sync_scratchpad_state(&mut self) {
+        if self.scratchpad.is_empty() {
+            self.scratchpad_selected = 0;
+            self.scratchpad_state.select(None);
+        } else {
+            if self.scratchpad_selected >= self.scratchpad.len() {
+                self.scratchpad_selected = self.scratchpad.len() - 1;
+            }
+            self.scratchpad_state.select(Some(self.scratchpad_selected));
         }
     }
 }

@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod editor;
 mod embed;
+mod linking;
 mod logging;
 mod related;
 mod ui;
@@ -12,6 +13,7 @@ mod watch;
 mod worker;
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -77,7 +79,8 @@ fn main() -> Result<()> {
     let notes = store.all_notes()?;
     // Seed the semantic index from any embeddings cached in a previous run.
     let semantic = build_semantic(&store, &notes)?;
-    let mut app = App::new(config.vault.clone(), config.ref_format, notes);
+    let scratchpad = store.load_scratchpad()?;
+    let mut app = App::new(config.vault.clone(), config.ref_format, notes, scratchpad);
     app.set_semantic(semantic);
 
     let mut terminal = setup_terminal()?;
@@ -194,6 +197,21 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     Ok(()) => app.set_status(format!("Copied: {reference}")),
                     Err(err) => app.set_status(format!("Clipboard error: {err}")),
                 },
+                Action::ScratchpadChanged => store.save_scratchpad(app.scratchpad_paths())?,
+                Action::ReindexPaths(paths) => {
+                    let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+                    if vault::sync_paths(store, &config.vault, &paths)? {
+                        let notes = store.all_notes()?;
+                        let semantic = build_semantic(store, &notes)?;
+                        app.set_notes(notes);
+                        app.set_semantic(semantic);
+                        if let Some(w) = &worker {
+                            if !embed_failed {
+                                submit_pending(store, w)?;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
