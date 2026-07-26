@@ -22,7 +22,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_list(f, app, left);
     render_preview(f, app, center);
-    render_related(f, right);
+    render_related(f, app, right);
     render_footer(f, app, footer);
 }
 
@@ -75,27 +75,38 @@ fn render_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(paragraph, area);
 }
 
-fn render_related(f: &mut Frame, area: ratatui::layout::Rect) {
-    let placeholder = Paragraph::new(vec![
-        Line::from("Related notes".bold()),
-        Line::from(""),
-        Line::from(Span::from("Arriving in Phase 2:").dim()),
-        Line::from(Span::from("• shared [[wikilinks]]").dim()),
-        Line::from(Span::from("• shared tags").dim()),
-        Line::from(Span::from("• keyword overlap").dim()),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" Context "))
-    .wrap(Wrap { trim: true });
+fn render_related(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let related = app.related();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Related ({}) ", related.len()));
 
-    f.render_widget(placeholder, area);
+    let paragraph = if related.is_empty() {
+        Paragraph::new(Span::from("No related notes.").dim())
+    } else {
+        let mut lines: Vec<Line> = Vec::new();
+        for note in related {
+            lines.push(Line::from(format!("• {}", note.title)));
+            lines.push(Line::from(Span::from(format!("  {}", note.reason)).dim()));
+        }
+        Paragraph::new(lines)
+    };
+
+    f.render_widget(paragraph.block(block).wrap(Wrap { trim: true }), area);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    // A transient status message takes precedence over the key hints.
+    if let Some(status) = &app.status {
+        let footer = Paragraph::new(Line::from(status.clone().bold()));
+        f.render_widget(footer, area);
+        return;
+    }
+
     let text = if app.searching {
         "type to filter   Enter: apply   Esc: clear"
     } else {
-        "j/k: move   /: search   e/Enter: edit   q: quit"
+        "j/k: move   /: search   e/Enter: edit   y: copy ref   q: quit"
     };
-    let footer = Paragraph::new(Line::from(text).dim());
-    f.render_widget(footer, area);
+    f.render_widget(Paragraph::new(Line::from(text).dim()), area);
 }

@@ -13,3 +13,4 @@ walkdir = "2"
 notify = "8"
 notify-debouncer-full = "0.7"
 rusqlite = { version = "0.37", features = ["bundled"] }
+arboard = "3"

@@ -1,11 +1,24 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 
 use crate::cli::Cli;
 
 /// Name of the per-vault state directory. Excluded from the vault scan.
 pub const STATE_DIR: &str = ".constellate";
+
+/// How a note reference is formatted when yanked to the clipboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum RefFormat {
+    /// Path relative to the vault root, e.g. `subdir/note.md`.
+    #[default]
+    Relative,
+    /// Absolute filesystem path.
+    Absolute,
+    /// Obsidian-style `[[Title]]` wikilink.
+    Wikilink,
+}
 
 /// Resolved runtime configuration derived from CLI arguments and the environment.
 pub struct Config {
@@ -13,6 +26,8 @@ pub struct Config {
     pub vault: PathBuf,
     /// Path to the SQLite index database.
     pub db_path: PathBuf,
+    /// Default format for clipboard note references.
+    pub ref_format: RefFormat,
 }
 
 impl Config {
@@ -35,6 +50,10 @@ impl Config {
             .db
             .unwrap_or_else(|| vault.join(STATE_DIR).join("index.db"));
 
-        Ok(Config { vault, db_path })
+        Ok(Config {
+            vault,
+            db_path,
+            ref_format: cli.ref_format,
+        })
     }
 }

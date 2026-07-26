@@ -2,9 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: Phase 1 implemented
+## Status: Phases 1–2 implemented
 
-Phase 1 (browse + search + `$EDITOR` handoff + live re-indexing) is built and working; Phases 2–5 are not yet started. What exists today: CLI (`--vault`, `--db`), recursive Markdown scanner (excludes `.constellate/` and hidden dirs), frontmatter/wikilink/tag/heading-chunk parser, SQLite index with incremental content-hashing, a synchronous ratatui 3-pane TUI (list + search + read-only preview; the right pane is a Phase-2 placeholder), `$EDITOR` suspend/restore, and a debounced `notify` watcher. `cargo test` covers parsing and the store round-trip. The rest of this file still describes the full intended design from `plan.md`; treat anything beyond the above as not-yet-built.
+Phases 1–2 (all three core use cases: browse, edit, discover/reference) are built and working; Phases 3–5 (embeddings, semantic similarity, web enrichment) are not yet started. What exists today: CLI (`--vault`, `--db`, `--ref-format`), recursive Markdown scanner (excludes `.constellate/` and hidden dirs), frontmatter/wikilink/tag/heading-chunk parser, SQLite index with incremental content-hashing, a synchronous ratatui 3-pane TUI (list + search + read-only preview + **related-notes pane**), the **cheap related-notes engine** (link graph + tag overlap + keyword overlap, in `related.rs`), **clipboard yank** of note references via `arboard` (relative/absolute/wikilink), `$EDITOR` suspend/restore, and a debounced `notify` watcher. `cargo test` covers parsing, the store round-trip, and relatedness (12 tests). The rest of this file still describes the full intended design from `plan.md`; treat anything beyond the above as not-yet-built.
 
 > **Dependency note:** `rusqlite` is pinned to `0.37` on purpose — 0.38+ pulls `libsqlite3-sys` ≥0.38, whose build script uses the still-unstable `cfg_select!` and won't compile on the current toolchain. Don't bump it without re-checking that.
 
@@ -51,4 +51,4 @@ The index lives at `<vault>/.constellate/index.db`. Inspect it with `sqlite3 <va
 
 ### Keybindings (in-app)
 
-`j`/`k` or `↑`/`↓` move the selection, `/` search (Enter applies, Esc clears), `e`/`Enter` open the selected note in `$EDITOR`, `q` quit.
+`j`/`k` or `↑`/`↓` move the selection, `/` search (Enter applies, Esc clears), `e`/`Enter` open the selected note in `$EDITOR`, `y` copy a reference to the selected note to the clipboard (format set by `--ref-format`), `q` quit.

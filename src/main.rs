@@ -1,7 +1,9 @@
 mod cli;
+mod clipboard;
 mod config;
 mod db;
 mod editor;
+mod related;
 mod ui;
 mod vault;
 mod watch;
@@ -44,7 +46,7 @@ fn main() -> Result<()> {
     );
 
     let notes = store.all_notes()?;
-    let mut app = App::new(config.vault.clone(), notes);
+    let mut app = App::new(config.vault.clone(), config.ref_format, notes);
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app, &mut store, &config);
@@ -102,6 +104,10 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                         app.set_notes(store.all_notes()?);
                     }
                 }
+                Action::Yank(reference) => match clipboard::copy(&reference) {
+                    Ok(()) => app.set_status(format!("Copied: {reference}")),
+                    Err(err) => app.set_status(format!("Clipboard error: {err}")),
+                },
             }
         }
     }

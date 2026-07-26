@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6,12 +7,14 @@ use rusqlite::{params, Connection};
 
 use crate::vault::ParsedNote;
 
-/// A note row loaded for browsing, searching, and preview.
+/// A note loaded for browsing, searching, preview, and relatedness.
 #[derive(Debug, Clone)]
 pub struct NoteRow {
     pub path: String,
     pub title: String,
     pub content: String,
+    pub tags: Vec<String>,
+    pub links: Vec<String>,
 }
 
 /// SQLite-backed index. Owns the connection; used only from the main thread.
@@ -149,19 +152,51 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// All notes ordered by title, for the browse list.
+    /// All notes ordered by title, each with its tags and outgoing links,
+    /// for the browse list and the related-notes engine.
     pub fn all_notes(&self) -> Result<Vec<NoteRow>> {
         let mut stmt = self
             .conn
             .prepare("SELECT path, title, content FROM notes ORDER BY title COLLATE NOCASE")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(NoteRow {
-                path: row.get(0)?,
-                title: row.get(1)?,
-                content: row.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut notes: Vec<NoteRow> = stmt
+            .query_map([], |row| {
+                Ok(NoteRow {
+                    path: row.get(0)?,
+                    title: row.get(1)?,
+                    content: row.get(2)?,
+                    tags: Vec::new(),
+                    links: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let index: HashMap<String, usize> = notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.path.clone(), i))
+            .collect();
+
+        let mut tag_stmt = self.conn.prepare("SELECT note_path, tag FROM tags")?;
+        let tag_rows = tag_stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for row in tag_rows {
+            let (path, tag) = row?;
+            if let Some(&i) = index.get(&path) {
+                notes[i].tags.push(tag);
+            }
+        }
+
+        let mut link_stmt = self.conn.prepare("SELECT note_path, target FROM links")?;
+        let link_rows = link_stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for row in link_rows {
+            let (path, target) = row?;
+            if let Some(&i) = index.get(&path) {
+                notes[i].links.push(target);
+            }
+        }
+
+        Ok(notes)
     }
 }
 
