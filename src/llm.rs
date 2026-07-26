@@ -148,14 +148,29 @@ fn write_synthesis(
     Ok(path)
 }
 
-/// Slug from a note's filename stem (its topic), e.g. `tony-blair-lack.md` →
-/// `tony-blair-lack`.
+/// Slug from a note's filename stem (its topic), with any leading Zettelkasten
+/// timestamp dropped so it doesn't add a second datestamp — e.g.
+/// `202111211733-tony-blair.md` → `tony-blair`.
 fn slug_from_filename(path: &Path) -> String {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    slugify(&stem)
+    slugify(strip_leading_id(&stem))
+}
+
+/// Drop a leading id of 8+ digits (and any following separator), so a source
+/// note named `202111211733-tony-blair` contributes `tony-blair`. Shorter
+/// leading numbers (e.g. `3-ideas`) are left alone.
+fn strip_leading_id(stem: &str) -> &str {
+    let digits = stem.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits >= 8 {
+        let rest = stem[digits..].trim_start_matches(['-', '_', ' ', '.']);
+        if !rest.is_empty() {
+            return rest;
+        }
+    }
+    stem
 }
 
 /// Lowercase, alphanumeric-only slug with runs of other characters collapsed to
@@ -221,6 +236,15 @@ mod tests {
         assert_eq!(slugify("What's missing / next"), "what-s-missing-next");
         assert_eq!(slugify("Connections"), "connections");
         assert_eq!(slugify("!!!"), "synthesis");
+    }
+
+    #[test]
+    fn strips_leading_zettelkasten_id() {
+        assert_eq!(strip_leading_id("202111211733-tony-blair-lack"), "tony-blair-lack");
+        assert_eq!(strip_leading_id("20211121_foo"), "foo");
+        assert_eq!(strip_leading_id("3-ideas"), "3-ideas"); // short number kept
+        assert_eq!(strip_leading_id("plain-note"), "plain-note");
+        assert_eq!(strip_leading_id("202111211733"), "202111211733"); // all-digits kept
     }
 
     #[test]

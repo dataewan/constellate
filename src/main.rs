@@ -181,6 +181,7 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_default();
+                        let path_str = path.to_string_lossy().to_string();
                         if vault::sync_paths(store, &config.vault, &[path])? {
                             let notes = store.all_notes()?;
                             let semantic = build_semantic(store, &notes)?;
@@ -191,6 +192,10 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                                     submit_pending(store, w)?;
                                 }
                             }
+                        }
+                        // Add the new note to the scratchpad.
+                        if app.add_path_to_scratchpad(path_str) {
+                            store.save_scratchpad(app.scratchpad_paths())?;
                         }
                         app.set_status(format!("Created synthesis: {name}"));
                     }

@@ -110,6 +110,9 @@ pub struct App {
     semantic: Option<SemanticIndex>,
     /// Related notes for the current selection (cheap + semantic, merged).
     related: Vec<RelatedNote>,
+    /// The note path the related list is computed from (the "note of interest":
+    /// the scratchpad highlight while pane 4 is focused, else the anchor).
+    related_basis: Option<String>,
     /// Indices into `notes` matching the current query.
     filtered: Vec<usize>,
     /// Selection within `filtered`.
@@ -160,6 +163,7 @@ impl App {
             related_index,
             semantic: None,
             related: Vec::new(),
+            related_basis: None,
             filtered: Vec::new(),
             selected: 0,
             focus: Focus::Notes,
@@ -397,15 +401,27 @@ impl App {
             return Action::None;
         };
         let name = self.display_filename(&path);
-        if self.scratchpad.contains(&path) {
+        if !self.add_path_to_scratchpad(path) {
             self.set_status(format!("Already in scratchpad: {name}"));
             return Action::None;
         }
-        self.scratchpad.push(path);
+        // Highlight the just-added note.
         self.scratchpad_selected = self.scratchpad.len() - 1;
         self.sync_scratchpad_state();
         self.set_status(format!("Added to scratchpad: {name}"));
         Action::ScratchpadChanged
+    }
+
+    /// Append a note path to the scratchpad if not already present, without
+    /// moving the selection. Returns whether it was added. Used to add a
+    /// freshly-generated synthesis note.
+    pub fn add_path_to_scratchpad(&mut self, path: String) -> bool {
+        if self.scratchpad.contains(&path) {
+            return false;
+        }
+        self.scratchpad.push(path);
+        self.sync_scratchpad_state();
+        true
     }
 
     /// Remove the highlighted scratchpad entry.
@@ -701,6 +717,9 @@ impl App {
     fn set_focus(&mut self, focus: Focus) {
         if self.focus != focus {
             self.focus = focus;
+            // Point the related list at whatever the newly-focused pane makes
+            // the note of interest (Related keeps its current list).
+            self.refresh_related();
             self.rebuild_preview();
         }
     }
@@ -736,7 +755,8 @@ impl App {
         self.scratchpad_selected =
             (self.scratchpad_selected as isize + delta).rem_euclid(len) as usize;
         self.scratchpad_state.select(Some(self.scratchpad_selected));
-        // Preview the highlighted scratchpad note (focus is Scratchpad here).
+        // Preview and relate to the highlighted scratchpad note.
+        self.refresh_related();
         self.rebuild_preview();
     }
 
@@ -822,13 +842,31 @@ impl App {
         self.sync_list_state();
     }
 
-    /// Called whenever the *anchor* note changes: recompute the related list
-    /// and re-render the preview.
+    /// Called whenever the *anchor* note changes: refresh the related list and
+    /// re-render the preview.
     fn select_note_changed(&mut self) {
+        self.refresh_related();
+        self.rebuild_preview();
+    }
+
+    /// The note the related list should be computed from: the highlighted
+    /// scratchpad note while pane 4 has focus, else the anchor. While the
+    /// Related pane has focus the basis is left as-is, so browsing it doesn't
+    /// pull the list out from under you.
+    fn note_of_interest(&self) -> Option<String> {
+        match self.focus {
+            Focus::Scratchpad => self.scratchpad.get(self.scratchpad_selected).cloned(),
+            Focus::Related => self.related_basis.clone(),
+            _ => self.anchor_note().map(|n| n.path.clone()),
+        }
+    }
+
+    /// Point the related list at the current note of interest and recompute it.
+    fn refresh_related(&mut self) {
+        self.related_basis = self.note_of_interest();
         self.related_selected = 0;
         self.recompute_related();
         self.sync_related_state();
-        self.rebuild_preview();
     }
 
     /// Re-render the cached preview for the currently active note.
@@ -841,13 +879,13 @@ impl App {
     }
 
     fn recompute_related(&mut self) {
-        self.related = match self.anchor_note().map(|n| n.path.clone()) {
+        self.related = match &self.related_basis {
             Some(path) => {
-                let cheap = self.related_index.related(&path, 12);
+                let cheap = self.related_index.related(path, 12);
                 let semantic = self
                     .semantic
                     .as_ref()
-                    .map(|s| s.similar(&path, 12))
+                    .map(|s| s.similar(path, 12))
                     .unwrap_or_default();
                 related::merge([cheap, semantic], 12)
             }
