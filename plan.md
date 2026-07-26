@@ -144,29 +144,29 @@ This means the right-hand "related notes" panel is useful from Phase 2, and embe
 
 ## 🗓️ Phased Development Roadmap
 
-### Phase 1: Core CLI, Browsing & Editing — *delivers use cases 1 & 2*
+### Phase 1: Core CLI, Browsing & Editing — done — *delivers use cases 1 & 2*
 
-- [ ] Initialize Rust workspace with `clap`, `pulldown-cmark`, `walkdir`, `ratatui`, `crossterm`.
-- [ ] Build the recursive crawler + heading-based chunker; exclude `.constellate/`.
-- [ ] Implement the SQLite schema (`notes`, `chunks`, `links`, `tags`, `meta`) and incremental hashing.
-- [ ] Build the file tree + full-text/title search so the vault is fully browsable.
-- [ ] Implement the `$EDITOR` suspend/launch/restore flow and re-index on exit.
-- [ ] Add `notify` + `notify-debouncer-full` for external edits.
+- [x] Initialize Rust workspace with `clap`, `pulldown-cmark`, `walkdir`, `ratatui`, `crossterm`.
+- [x] Build the recursive crawler + heading-based chunker; exclude `.constellate/`.
+- [x] Implement the SQLite schema (`notes`, `chunks`, `links`, `tags`, `meta`) and incremental hashing.
+- [x] Build the file tree + full-text/title search so the vault is fully browsable.
+- [x] Implement the `$EDITOR` suspend/launch/restore flow and re-index on exit.
+- [x] Add `notify` + `notify-debouncer-full` for external edits.
 
-### Phase 2: References & Cheap Related Notes — *delivers use case 3*
+### Phase 2: References & Cheap Related Notes — done — *delivers use case 3*
 
-- [ ] Extract and store `[[wikilinks]]` and tags during parsing.
-- [ ] Implement the Related Notes Engine (link graph + tag + keyword overlap) and render it in the right pane.
-- [ ] Add `arboard` clipboard yank with configurable reference formats + status-line confirmation.
+- [x] Extract and store `[[wikilinks]]` and tags during parsing.
+- [x] Implement the Related Notes Engine (link graph + tag + keyword overlap) and render it in the right pane.
+- [x] Add `arboard` clipboard yank with configurable reference formats + status-line confirmation.
 
 **→ At this point all three use cases are met. Ship and dogfood before continuing.**
 
-### Phase 3: Local Semantic Embeddings (Ollama)
+### Phase 3: Local Semantic Embeddings (Ollama) — done
 
-- [ ] Define the `Embedder` trait; implement `OllamaEmbedder` (worker thread, `reqwest` blocking).
-- [ ] Store embeddings as blobs; implement brute-force cosine similarity in Rust.
-- [ ] Wire the background worker + channel so (re)indexing never blocks the UI.
-- [ ] Merge semantic results into the related-notes list; gate rebuilds via the `meta` table.
+- [x] Define the `Embedder` trait; implement `OllamaEmbedder` (worker thread, `reqwest` blocking).
+- [x] Store embeddings as blobs; implement brute-force cosine similarity in Rust.
+- [x] Wire the background worker + channel so (re)indexing never blocks the UI.
+- [x] Merge semantic results into the related-notes list; gate rebuilds via the `meta` table.
 
 ### Phase 4: Optional In-Process Backend & Polish
 

@@ -73,6 +73,12 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_tags_note ON tags(note_path);
             CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 
+            CREATE TABLE IF NOT EXISTS embeddings (
+                chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                dim      INTEGER NOT NULL,
+                vector   BLOB NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -80,6 +86,80 @@ impl Store {
             "#,
         )?;
         Ok(())
+    }
+
+    fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok())
+    }
+
+    fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Ensure stored embeddings match the active backend/model. If the model
+    /// changed, discard all embeddings so they are recomputed with the new one.
+    pub fn reconcile_embedding_backend(&mut self, model: &str) -> Result<()> {
+        if self.meta_get("embed_model")?.as_deref() != Some(model) {
+            self.conn.execute("DELETE FROM embeddings", [])?;
+            self.meta_set("embed_model", model)?;
+        }
+        Ok(())
+    }
+
+    /// Chunks that still lack an embedding, as `(chunk_id, text)` pairs.
+    pub fn chunks_without_embeddings(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.header, c.content
+             FROM chunks c
+             LEFT JOIN embeddings e ON e.chunk_id = c.id
+             WHERE e.chunk_id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let header: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            Ok((id, format!("{header}\n{content}").trim().to_string()))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, text)| !text.is_empty())
+            .collect())
+    }
+
+    /// Persist an embedding vector for a chunk.
+    pub fn store_embedding(&mut self, chunk_id: i64, vector: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO embeddings (chunk_id, dim, vector) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chunk_id) DO UPDATE SET dim = excluded.dim, vector = excluded.vector",
+            params![chunk_id, vector.len() as i64, crate::embed::to_blob(vector)],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored chunk embedding as `(note_path, vector)`.
+    pub fn all_chunk_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.note_path, e.vector
+             FROM embeddings e
+             JOIN chunks c ON c.id = e.chunk_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((path, crate::embed::from_blob(&blob)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The stored content hash for a note path, if indexed.

@@ -3,10 +3,13 @@ mod clipboard;
 mod config;
 mod db;
 mod editor;
+mod embed;
+mod logging;
 mod related;
 mod ui;
 mod vault;
 mod watch;
+mod worker;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -24,9 +27,25 @@ use ratatui::Terminal;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::db::store::Store;
+use crate::embed::SemanticIndex;
 use crate::ui::{Action, App};
+use crate::worker::{Worker, WorkerMsg};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Build the note-level semantic index from whatever embeddings are cached.
+fn build_semantic(store: &Store, notes: &[db::store::NoteRow]) -> Result<SemanticIndex> {
+    Ok(SemanticIndex::build(notes, store.all_chunk_vectors()?))
+}
+
+/// Send any chunks still lacking embeddings to the worker.
+fn submit_pending(store: &Store, worker: &Worker) -> Result<()> {
+    let pending = store.chunks_without_embeddings()?;
+    if !pending.is_empty() {
+        worker.submit(pending);
+    }
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -45,8 +64,21 @@ fn main() -> Result<()> {
         config.vault.display()
     );
 
+    // Reconcile the embedding backend before loading, so a model change clears
+    // stale vectors up front.
+    if config.embed_enabled {
+        store.reconcile_embedding_backend(&config.embed_model)?;
+        eprintln!(
+            "Embeddings: {} via {} (computed in the background)",
+            config.embed_model, config.ollama_url
+        );
+    }
+
     let notes = store.all_notes()?;
+    // Seed the semantic index from any embeddings cached in a previous run.
+    let semantic = build_semantic(&store, &notes)?;
     let mut app = App::new(config.vault.clone(), config.ref_format, notes);
+    app.set_semantic(semantic);
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app, &mut store, &config);
@@ -73,6 +105,15 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
     // Keep the watch handle alive for the duration of the loop.
     let (_watch_handle, rx) = watch::watch(&config.vault)?;
 
+    // Spawn the embedding worker and queue the initial backlog.
+    let worker = config
+        .embed_enabled
+        .then(|| worker::spawn(config.ollama_url.clone(), config.embed_model.clone()));
+    let mut embed_failed = false;
+    if let Some(w) = &worker {
+        submit_pending(store, w)?;
+    }
+
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -84,7 +125,46 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
             }
         }
         if changed {
-            app.set_notes(store.all_notes()?);
+            let notes = store.all_notes()?;
+            let semantic = build_semantic(store, &notes)?;
+            app.set_notes(notes);
+            app.set_semantic(semantic);
+            if let Some(w) = &worker {
+                if !embed_failed {
+                    submit_pending(store, w)?;
+                }
+            }
+        }
+
+        // Drain embedding results; rebuild the semantic index once a batch ends.
+        if let Some(w) = &worker {
+            let mut batch_done = false;
+            while let Ok(msg) = w.results.try_recv() {
+                match msg {
+                    WorkerMsg::Embedded { chunk_id, vector } => {
+                        store.store_embedding(chunk_id, &vector)?;
+                    }
+                    WorkerMsg::Skipped { chunk_id, reason } => {
+                        logging::log_line(
+                            &config.log_path,
+                            &format!("skipped embedding for chunk {chunk_id}: {reason}"),
+                        );
+                    }
+                    WorkerMsg::Done => batch_done = true,
+                    WorkerMsg::Failed(err) => {
+                        embed_failed = true;
+                        logging::log_line(&config.log_path, &format!("embeddings disabled: {err}"));
+                        app.set_status(format!(
+                            "Embeddings unavailable (is Ollama running?) — see {}",
+                            config.log_path.display()
+                        ));
+                    }
+                }
+            }
+            if batch_done {
+                let notes = store.all_notes()?;
+                app.set_semantic(build_semantic(store, &notes)?);
+            }
         }
 
         if !event::poll(Duration::from_millis(200))? {
@@ -101,7 +181,15 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     editor::open(terminal, &path)?;
                     // Reflect any edits immediately, then refresh the view.
                     if vault::sync_paths(store, &config.vault, &[path])? {
-                        app.set_notes(store.all_notes()?);
+                        let notes = store.all_notes()?;
+                        let semantic = build_semantic(store, &notes)?;
+                        app.set_notes(notes);
+                        app.set_semantic(semantic);
+                        if let Some(w) = &worker {
+                            if !embed_failed {
+                                submit_pending(store, w)?;
+                            }
+                        }
                     }
                 }
                 Action::Yank(reference) => match clipboard::copy(&reference) {

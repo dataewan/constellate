@@ -16,9 +16,41 @@ const W_KEYWORD: f32 = 0.5; // per shared title keyword
 /// A related note with its combined score and the signals that produced it.
 #[derive(Debug, Clone)]
 pub struct RelatedNote {
+    pub path: String,
     pub title: String,
     pub score: f32,
     pub reason: String,
+}
+
+/// Merge several ranked lists (e.g. cheap signals + semantic similarity) into
+/// one, summing scores and joining reasons for notes that appear in more than
+/// one list. Returns the top `limit` by score.
+pub fn merge(lists: impl IntoIterator<Item = Vec<RelatedNote>>, limit: usize) -> Vec<RelatedNote> {
+    let mut by_path: HashMap<String, RelatedNote> = HashMap::new();
+    for list in lists {
+        for note in list {
+            by_path
+                .entry(note.path.clone())
+                .and_modify(|existing| {
+                    existing.score += note.score;
+                    if !existing.reason.is_empty() && !note.reason.is_empty() {
+                        existing.reason.push_str(" · ");
+                    }
+                    existing.reason.push_str(&note.reason);
+                })
+                .or_insert(note);
+        }
+    }
+
+    let mut merged: Vec<RelatedNote> = by_path.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    merged.truncate(limit);
+    merged
 }
 
 struct Entry {
@@ -122,6 +154,7 @@ impl RelatedIndex {
 
             if score > 0.0 {
                 out.push(RelatedNote {
+                    path: other.path.clone(),
                     title: other.title.clone(),
                     score,
                     // Show the two strongest-listed signals to keep it compact.
@@ -235,5 +268,36 @@ mod tests {
         ];
         let idx = RelatedIndex::build(&notes);
         assert!(idx.related("/v/a.md", 10).is_empty());
+    }
+
+    #[test]
+    fn merge_sums_scores_and_joins_reasons() {
+        let cheap = vec![RelatedNote {
+            path: "/v/b.md".into(),
+            title: "Beta".into(),
+            score: 3.0,
+            reason: "link".into(),
+        }];
+        let semantic = vec![
+            RelatedNote {
+                path: "/v/b.md".into(),
+                title: "Beta".into(),
+                score: 2.0,
+                reason: "similar 80%".into(),
+            },
+            RelatedNote {
+                path: "/v/c.md".into(),
+                title: "Gamma".into(),
+                score: 1.0,
+                reason: "similar 60%".into(),
+            },
+        ];
+        let merged = merge([cheap, semantic], 10);
+        assert_eq!(merged.len(), 2);
+        // Beta appears in both lists: scores sum, reasons join.
+        assert_eq!(merged[0].title, "Beta");
+        assert_eq!(merged[0].score, 5.0);
+        assert!(merged[0].reason.contains("link"));
+        assert!(merged[0].reason.contains("similar 80%"));
     }
 }

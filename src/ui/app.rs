@@ -5,7 +5,8 @@ use ratatui::widgets::ListState;
 
 use crate::config::RefFormat;
 use crate::db::store::NoteRow;
-use crate::related::{RelatedIndex, RelatedNote};
+use crate::embed::SemanticIndex;
+use crate::related::{self, RelatedIndex, RelatedNote};
 
 /// Result of handling a key, actioned by the main loop.
 pub enum Action {
@@ -23,9 +24,11 @@ pub struct App {
     ref_format: RefFormat,
     /// Every indexed note, ordered by title.
     notes: Vec<NoteRow>,
-    /// Precomputed relatedness over the whole vault.
+    /// Precomputed cheap relatedness (links/tags/keywords) over the vault.
     related_index: RelatedIndex,
-    /// Related notes for the current selection.
+    /// Optional semantic index; present once embeddings have been computed.
+    semantic: Option<SemanticIndex>,
+    /// Related notes for the current selection (cheap + semantic, merged).
     related: Vec<RelatedNote>,
     /// Indices into `notes` matching the current query.
     filtered: Vec<usize>,
@@ -49,6 +52,7 @@ impl App {
             ref_format,
             notes,
             related_index,
+            semantic: None,
             related: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
@@ -87,6 +91,16 @@ impl App {
     /// Related notes for the current selection.
     pub fn related(&self) -> &[RelatedNote] {
         &self.related
+    }
+
+    /// Install (or replace) the semantic index and refresh related notes.
+    pub fn set_semantic(&mut self, semantic: SemanticIndex) {
+        self.semantic = if semantic.is_empty() {
+            None
+        } else {
+            Some(semantic)
+        };
+        self.recompute_related();
     }
 
     /// The currently selected note, if any.
@@ -204,7 +218,15 @@ impl App {
 
     fn recompute_related(&mut self) {
         self.related = match self.current_note().map(|n| n.path.clone()) {
-            Some(path) => self.related_index.related(&path, 12),
+            Some(path) => {
+                let cheap = self.related_index.related(&path, 12);
+                let semantic = self
+                    .semantic
+                    .as_ref()
+                    .map(|s| s.similar(&path, 12))
+                    .unwrap_or_default();
+                related::merge([cheap, semantic], 12)
+            }
             None => Vec::new(),
         };
     }

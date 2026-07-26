@@ -2,9 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: Phases 1–2 implemented
+## Status: Phases 1–3 implemented
 
-Phases 1–2 (all three core use cases: browse, edit, discover/reference) are built and working; Phases 3–5 (embeddings, semantic similarity, web enrichment) are not yet started. What exists today: CLI (`--vault`, `--db`, `--ref-format`), recursive Markdown scanner (excludes `.constellate/` and hidden dirs), frontmatter/wikilink/tag/heading-chunk parser, SQLite index with incremental content-hashing, a synchronous ratatui 3-pane TUI (list + search + read-only preview + **related-notes pane**), the **cheap related-notes engine** (link graph + tag overlap + keyword overlap, in `related.rs`), **clipboard yank** of note references via `arboard` (relative/absolute/wikilink), `$EDITOR` suspend/restore, and a debounced `notify` watcher. `cargo test` covers parsing, the store round-trip, and relatedness (12 tests). The rest of this file still describes the full intended design from `plan.md`; treat anything beyond the above as not-yet-built.
+Phases 1–3 are built and working; Phase 5 (optional web enrichment) and the optional `fastembed` backend (part of Phase 4) are not yet started. What exists today: CLI (`--vault`, `--db`, `--ref-format`, `--no-embed`, `--embed-model`, `--ollama-url`), recursive Markdown scanner (excludes `.constellate/` and hidden dirs), frontmatter/wikilink/tag/heading-chunk parser, SQLite index with incremental content-hashing, a synchronous ratatui 3-pane TUI (list + search + read-only preview + related-notes pane), the cheap related-notes engine (`related.rs`), **semantic embeddings via Ollama** (`embed/`, computed on a background worker thread, `worker.rs`) with brute-force cosine similarity **merged into** the related-notes list, **clipboard yank** via `arboard`, `$EDITOR` suspend/restore, a debounced `notify` watcher, and a file logger (`logging.rs`) for background-worker events. `cargo test` covers parsing, the store round-trip, relatedness, merge, and semantic similarity (16 tests). The rest of this file still describes the full intended design from `plan.md`; treat anything beyond the above as not-yet-built.
 
 > **Dependency note:** `rusqlite` is pinned to `0.37` on purpose — 0.38+ pulls `libsqlite3-sys` ≥0.38, whose build script uses the still-unstable `cfg_select!` and won't compile on the current toolchain. Don't bump it without re-checking that.
 
@@ -21,12 +21,13 @@ A **synchronous** ratatui render loop plus a background worker thread; slow work
 - **Vault Engine** — `walkdir` discovers `.md` files (excluding the `.constellate/` state dir); `pulldown-cmark` parses frontmatter, `[[wikilinks]]`, tags, and headings, splitting documents into heading-grouped chunks; `notify` + `notify-debouncer-full` coalesces save events and re-indexes only affected notes.
 - **Related Notes Engine** — layered, cheapest first: shared `[[wikilinks]]`, tag overlap, title/keyword overlap, then (Phase 3+) semantic cosine similarity merged into the same ranked list. Useful from Phase 2 without any model.
 - **Storage** — `<vault>/.constellate/index.db` via `rusqlite` (bundled). Tables: `notes`, `chunks` (with `content_hash`), `links`, `tags`, `embeddings` (chunk_id, `f32` BLOB), `meta` (active backend/model/dimension → rebuild on mismatch).
-- **Vector Search (Phase 3+)** — pluggable `Embedder` trait: `OllamaEmbedder` (**primary**, `reqwest` blocking to a local Ollama server, e.g. `nomic-embed-text`) or feature-gated `FastEmbedder` (in-process ONNX `all-MiniLM-L6-v2`). Brute-force top-K (K=5) cosine over blob-decoded vectors on the worker thread.
+- **Vector Search (`embed/`, implemented)** — pluggable `Embedder` trait: `OllamaEmbedder` (**primary**, `reqwest` blocking to a local Ollama server, default `nomic-embed-text`). Chunk vectors are stored as BLOBs; `SemanticIndex` aggregates them to a normalized per-note mean vector and does brute-force cosine in Rust, above a similarity threshold. Results are scaled and **merged** into the cheap related list via `related::merge`. Cached embeddings power semantic search even with `--no-embed` (offline); the `meta.embed_model` row gates a rebuild when the model changes. A feature-gated in-process `FastEmbedder` is planned but not yet built.
+  - **Embedding robustness (learned the hard way):** embedding models have a fixed context window (nomic-embed-text = 2048 tokens); over-long input returns HTTP 500. `OllamaEmbedder` truncates input to `MAX_INPUT_CHARS` (4000) to stay under it. Failures are classified via `EmbedError`: `Unreachable` (backend down → stop this session, show "unavailable") vs `Skip` (one bad input → log it and continue). **The worker must never abort the whole batch on a single chunk failure** — that was the original bug. Skips/failures are written to `<vault>/.constellate/constellate.log` (there is no stderr logging while the TUI owns the terminal).
 - **Editor Integration** — `e`/`Enter` suspends the TUI (leave alternate screen, disable raw mode), spawns `$EDITOR` as a foreground child via `std::process::Command`, then restores the TUI and re-indexes the edited file on exit.
 - **TUI** — `ratatui` + `crossterm` 3-pane layout: file tree/search (left), **read-only** note renderer (center), context inspector with related notes + optional web summaries (right). `y` yanks a note reference (relative path / absolute / `[[wikilink]]`, configurable) to the system clipboard via `arboard`.
 - **External Knowledge Engine (Phase 5, optional/experimental)** — key-noun extraction → Wikipedia REST summary on the worker thread. Off by default; may be cut.
 
-Planned module layout: `src/{main.rs, cli.rs, config.rs, vault/{scanner,chunker}, db/store, related.rs, embed/{ollama,fastembed}, worker.rs, editor.rs, clipboard.rs, external/wikipedia, ui/{layout,app}}`.
+Current module layout: `src/{main.rs, cli.rs, config.rs, vault/{mod,scanner,chunker}, db/{mod,store}, related.rs, embed/{mod,ollama}, worker.rs, editor.rs, clipboard.rs, logging.rs, ui/{mod,app}, watch.rs}`. Not yet present: `embed/fastembed.rs`, `external/wikipedia.rs`.
 
 ## Key architectural constraints
 
@@ -42,12 +43,14 @@ Planned module layout: `src/{main.rs, cli.rs, config.rs, vault/{scanner,chunker}
 
 - `cargo build` / `cargo build --release` — build
 - `cargo run -- --vault ~/Notes` — run the TUI against a vault (defaults to the current dir)
+- `cargo run -- --vault ~/Notes --no-embed` — run without Ollama (cheap relatedness + any cached embeddings)
+- `cargo run -- --vault ~/Notes --embed-model nomic-embed-text --ollama-url http://localhost:11434` — embedding backend options
 - `cargo test` — run all tests
 - `cargo test <name>` — run a single test by name substring
 - `cargo clippy` — lint
 - `cargo fmt` — format
 
-The index lives at `<vault>/.constellate/index.db`. Inspect it with `sqlite3 <vault>/.constellate/index.db`.
+The index lives at `<vault>/.constellate/index.db`. Inspect it with `sqlite3 <vault>/.constellate/index.db`. Background-worker events (embedding skips/failures) are logged to `<vault>/.constellate/constellate.log` — check there first when embeddings/related notes misbehave.
 
 ### Keybindings (in-app)
 

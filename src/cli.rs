@@ -19,4 +19,16 @@ pub struct Cli {
     /// Format used when yanking a note reference to the clipboard.
     #[arg(long, value_enum, default_value = "relative")]
     pub ref_format: RefFormat,
+
+    /// Disable semantic embeddings (skip Ollama; use only cheap relatedness).
+    #[arg(long)]
+    pub no_embed: bool,
+
+    /// Ollama embedding model.
+    #[arg(long, default_value = "nomic-embed-text")]
+    pub embed_model: String,
+
+    /// Base URL of the Ollama server.
+    #[arg(long, default_value = "http://localhost:11434")]
+    pub ollama_url: String,
 }
