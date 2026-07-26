@@ -1,0 +1,3 @@
+/target
+# App state directory created inside a vault
+.constellate/

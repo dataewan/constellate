@@ -1,0 +1,15 @@
+[package]
+name = "constellate"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-native knowledge management & discovery engine for a Markdown vault"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+pulldown-cmark = "0.13"
+walkdir = "2"
+notify = "8"
+notify-debouncer-full = "0.7"
+rusqlite = { version = "0.37", features = ["bundled"] }
