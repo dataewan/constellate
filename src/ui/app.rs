@@ -8,6 +8,7 @@ use crate::config::RefFormat;
 use crate::db::store::NoteRow;
 use crate::embed::SemanticIndex;
 use crate::linking;
+use crate::llm::{self, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::ui::markdown;
 
@@ -50,6 +51,22 @@ pub enum Action {
     ScratchpadChanged,
     /// These files were modified on disk and should be re-indexed.
     ReindexPaths(Vec<String>),
+    /// Run an LLM synthesis over the scratchpad on a background thread.
+    GenerateSynthesis(SynthesisRequest),
+}
+
+/// The scratchpad → LLM prompt picker: choose a preset or enter a custom prompt.
+struct PromptPicker {
+    /// 0..PROMPTS.len() selects a preset; the last row selects "Custom…".
+    selected: usize,
+    /// `Some(text)` when in the custom free-text input mode.
+    custom: Option<String>,
+}
+
+/// Read-only view of the prompt picker, for rendering the modal.
+pub enum PromptPickerView {
+    List { labels: Vec<String>, selected: usize },
+    Custom { text: String },
 }
 
 /// A candidate pair of notes to offer a link between, during the linking flow.
@@ -122,6 +139,8 @@ pub struct App {
     pub scratchpad_state: ListState,
     /// In-progress link-the-scratchpad session, if any.
     linking: Option<LinkingState>,
+    /// Open prompt picker for LLM synthesis, if any.
+    prompt_picker: Option<PromptPicker>,
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
@@ -155,6 +174,7 @@ impl App {
             scratchpad_selected: 0,
             scratchpad_state: ListState::default(),
             linking: None,
+            prompt_picker: None,
             status: None,
         };
         app.refilter();
@@ -298,9 +318,12 @@ impl App {
         // Any deliberate key clears a lingering status message.
         self.status = None;
 
-        // The linking modal captures all input while active.
+        // Modals capture all input while active.
         if self.linking.is_some() {
             return self.handle_linking_key(key);
+        }
+        if self.prompt_picker.is_some() {
+            return self.handle_prompt_key(key);
         }
 
         if self.searching {
@@ -352,6 +375,7 @@ impl App {
                 return self.remove_from_scratchpad();
             }
             KeyCode::Char('l') => self.start_linking(),
+            KeyCode::Char('s') => self.start_synthesis(),
             KeyCode::Char('y') => {
                 if let Some(reference) = self.current_reference() {
                     return Action::Yank(reference);
@@ -530,6 +554,133 @@ impl App {
         } else {
             Action::ReindexPaths(state.modified)
         }
+    }
+
+    /// A read-only snapshot of the prompt picker, for rendering.
+    pub fn prompt_picker_view(&self) -> Option<PromptPickerView> {
+        self.prompt_picker.as_ref().map(|picker| match &picker.custom {
+            Some(text) => PromptPickerView::Custom { text: text.clone() },
+            None => {
+                let mut labels: Vec<String> =
+                    llm::PROMPTS.iter().map(|(l, _)| (*l).to_string()).collect();
+                labels.push("Custom…".to_string());
+                PromptPickerView::List {
+                    labels,
+                    selected: picker.selected,
+                }
+            }
+        })
+    }
+
+    /// Open the prompt picker for LLM synthesis over the scratchpad.
+    fn start_synthesis(&mut self) {
+        if self.scratchpad.is_empty() {
+            self.set_status("Add notes to the scratchpad first.");
+            return;
+        }
+        self.prompt_picker = Some(PromptPicker {
+            selected: 0,
+            custom: None,
+        });
+    }
+
+    /// Handle a key while the prompt picker is open.
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Action {
+        let in_custom = self
+            .prompt_picker
+            .as_ref()
+            .is_some_and(|p| p.custom.is_some());
+
+        if in_custom {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(p) = self.prompt_picker.as_mut() {
+                        p.custom = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    let text = self
+                        .prompt_picker
+                        .as_ref()
+                        .and_then(|p| p.custom.clone())
+                        .unwrap_or_default();
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        return self.confirm_synthesis(&text);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
+                        t.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
+                        t.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        let count = llm::PROMPTS.len();
+        match key.code {
+            KeyCode::Esc => self.prompt_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(p) = self.prompt_picker.as_mut() {
+                    p.selected = (p.selected + count) % (count + 1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(p) = self.prompt_picker.as_mut() {
+                    p.selected = (p.selected + 1) % (count + 1);
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.prompt_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+                if selected >= count {
+                    if let Some(p) = self.prompt_picker.as_mut() {
+                        p.custom = Some(String::new());
+                    }
+                } else {
+                    let (_label, text) = llm::PROMPTS[selected];
+                    return self.confirm_synthesis(text);
+                }
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = c as usize - '1' as usize;
+                if idx < count {
+                    let (_label, text) = llm::PROMPTS[idx];
+                    return self.confirm_synthesis(text);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Close the picker and request generation over the scratchpad notes.
+    fn confirm_synthesis(&mut self, prompt_text: &str) -> Action {
+        self.prompt_picker = None;
+        let sources: Vec<(PathBuf, String)> = self
+            .scratchpad
+            .iter()
+            .filter_map(|path| {
+                self.notes
+                    .iter()
+                    .find(|n| &n.path == path)
+                    .map(|n| (PathBuf::from(&n.path), n.title.clone()))
+            })
+            .collect();
+        if sources.is_empty() {
+            self.set_status("Scratchpad is empty.");
+            return Action::None;
+        }
+        Action::GenerateSynthesis(SynthesisRequest {
+            prompt_text: prompt_text.to_string(),
+            sources,
+        })
     }
 
     /// Enter does something different depending on the focused pane.

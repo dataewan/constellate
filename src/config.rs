@@ -44,6 +44,10 @@ pub struct Config {
     pub ref_format: RefFormat,
     /// The embedding backend, or `None` when embeddings are disabled.
     pub embed_backend: Option<Backend>,
+    /// Base URL of the Ollama server (for LLM synthesis).
+    pub ollama_url: String,
+    /// Ollama chat model for scratchpad LLM synthesis.
+    pub llm_model: String,
 }
 
 impl Config {
@@ -73,7 +77,11 @@ impl Config {
         let embed_backend = if cli.no_embed {
             None
         } else {
-            Some(resolve_backend(cli.embed_backend, cli.ollama_url, cli.embed_model)?)
+            Some(resolve_backend(
+                cli.embed_backend,
+                cli.ollama_url.clone(),
+                cli.embed_model,
+            )?)
         };
 
         Ok(Config {
@@ -82,6 +90,8 @@ impl Config {
             log_path,
             ref_format: cli.ref_format,
             embed_backend,
+            ollama_url: cli.ollama_url,
+            llm_model: cli.llm_model,
         })
     }
 }

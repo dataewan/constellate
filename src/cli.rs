@@ -35,4 +35,8 @@ pub struct Cli {
     /// Base URL of the Ollama server (used when `--embed-backend ollama`).
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_url: String,
+
+    /// Ollama chat model used for scratchpad LLM synthesis (the `s` command).
+    #[arg(long, default_value = "qwen2.5")]
+    pub llm_model: String,
 }

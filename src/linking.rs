@@ -29,7 +29,7 @@ pub fn append_link(source: &Path, target: &Path, title: &str) -> Result<()> {
 }
 
 /// Format `[title](dest)`, wrapping the destination in `<>` if it has spaces.
-fn markdown_link(title: &str, dest: &str) -> String {
+pub fn markdown_link(title: &str, dest: &str) -> String {
     if dest.contains(' ') {
         format!("[{title}](<{dest}>)")
     } else {
@@ -39,7 +39,7 @@ fn markdown_link(title: &str, dest: &str) -> String {
 
 /// The path to `to`, relative to the directory `from_dir`. Both are expected to
 /// be absolute (note paths and the vault root are canonicalized).
-fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
+pub fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
     let from: Vec<_> = from_dir.components().collect();
     let to_c: Vec<_> = to.components().collect();
     let common = from

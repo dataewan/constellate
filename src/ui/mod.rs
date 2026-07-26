@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub use app::LinkPrompt;
+pub use app::{LinkPrompt, PromptPickerView};
 
 /// Render the full three-pane layout plus a footer.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -41,9 +41,63 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_related(f, app, right, accent);
     render_footer(f, app, footer, accent);
 
-    // The linking modal overlays everything while active.
+    // Modals overlay everything while active.
     if let Some(prompt) = app.linking_prompt() {
         render_link_modal(f, &prompt);
+    }
+    if let Some(view) = app.prompt_picker_view() {
+        render_prompt_modal(f, &view);
+    }
+}
+
+fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
+    match view {
+        PromptPickerView::List { labels, selected } => {
+            let area = centered_rect(56, labels.len() as u16 + 4, f.area());
+            f.render_widget(Clear, area);
+            let items: Vec<ListItem> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    let key = if i < 9 {
+                        format!("[{}] ", i + 1)
+                    } else {
+                        "    ".to_string()
+                    };
+                    ListItem::new(format!("{key}{label}"))
+                })
+                .collect();
+            let mut state = ratatui::widgets::ListState::default();
+            state.select(Some(*selected));
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Send scratchpad to LLM ")
+                        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                )
+                .highlight_style(selection_highlight())
+                .highlight_symbol("› ");
+            f.render_stateful_widget(list, area, &mut state);
+        }
+        PromptPickerView::Custom { text } => {
+            let area = centered_rect(60, 6, f.area());
+            f.render_widget(Clear, area);
+            let lines = vec![
+                Line::from("Custom prompt (Enter to send · Esc to cancel):".dim()),
+                Line::from(""),
+                Line::from(format!("{text}▏")),
+            ];
+            let modal = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Send scratchpad to LLM ")
+                        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(modal, area);
+        }
     }
 }
 

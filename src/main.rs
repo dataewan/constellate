@@ -5,6 +5,7 @@ mod db;
 mod editor;
 mod embed;
 mod linking;
+mod llm;
 mod logging;
 mod related;
 mod ui;
@@ -111,6 +112,9 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
     // Spawn the embedding worker and queue the initial backlog.
     let worker = config.embed_backend.clone().map(worker::spawn);
     let mut embed_failed = false;
+
+    // Receiver for a background LLM synthesis, if one is running.
+    let mut synthesis: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>> = None;
     if let Some(w) = &worker {
         submit_pending(store, w)?;
     }
@@ -168,6 +172,37 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
             }
         }
 
+        // Collect a finished LLM synthesis, if any.
+        if let Some(rx) = &synthesis {
+            if let Ok(outcome) = rx.try_recv() {
+                match outcome {
+                    Ok(path) => {
+                        let name = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if vault::sync_paths(store, &config.vault, &[path])? {
+                            let notes = store.all_notes()?;
+                            let semantic = build_semantic(store, &notes)?;
+                            app.set_notes(notes);
+                            app.set_semantic(semantic);
+                            if let Some(w) = &worker {
+                                if !embed_failed {
+                                    submit_pending(store, w)?;
+                                }
+                            }
+                        }
+                        app.set_status(format!("Created synthesis: {name}"));
+                    }
+                    Err(err) => {
+                        logging::log_line(&config.log_path, &format!("synthesis failed: {err}"));
+                        app.set_status(format!("Synthesis failed: {err}"));
+                    }
+                }
+                synthesis = None;
+            }
+        }
+
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -198,6 +233,21 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     Err(err) => app.set_status(format!("Clipboard error: {err}")),
                 },
                 Action::ScratchpadChanged => store.save_scratchpad(app.scratchpad_paths())?,
+                Action::GenerateSynthesis(request) => {
+                    if synthesis.is_some() {
+                        app.set_status("A synthesis is already running…");
+                    } else {
+                        let url = config.ollama_url.clone();
+                        let model = config.llm_model.clone();
+                        let vault = config.vault.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(llm::run_synthesis(&url, &model, &vault, &request));
+                        });
+                        synthesis = Some(rx);
+                        app.set_status(format!("Generating synthesis with {}…", config.llm_model));
+                    }
+                }
                 Action::ReindexPaths(paths) => {
                     let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
                     if vault::sync_paths(store, &config.vault, &paths)? {
