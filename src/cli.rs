@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::config::RefFormat;
+use crate::config::{EmbedBackend, RefFormat};
 
 /// Terminal-native knowledge management & discovery for a Markdown vault.
 #[derive(Parser, Debug)]
@@ -20,15 +20,19 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "relative")]
     pub ref_format: RefFormat,
 
-    /// Disable semantic embeddings (skip Ollama; use only cheap relatedness).
+    /// Disable semantic embeddings (skip the backend; use only cheap relatedness).
     #[arg(long)]
     pub no_embed: bool,
 
-    /// Ollama embedding model.
+    /// Embedding backend. `fastembed` requires building with `--features fastembed`.
+    #[arg(long, value_enum, default_value = "ollama")]
+    pub embed_backend: EmbedBackend,
+
+    /// Ollama embedding model (used when `--embed-backend ollama`).
     #[arg(long, default_value = "nomic-embed-text")]
     pub embed_model: String,
 
-    /// Base URL of the Ollama server.
+    /// Base URL of the Ollama server (used when `--embed-backend ollama`).
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_url: String,
 }

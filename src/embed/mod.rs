@@ -1,9 +1,57 @@
 pub mod ollama;
+#[cfg(feature = "fastembed")]
+pub mod fastembed;
 
 use std::collections::HashMap;
 
 use crate::db::store::NoteRow;
 use crate::related::RelatedNote;
+
+/// Selects and constructs an embedding backend. The `FastEmbed` variant only
+/// exists when built with the `fastembed` feature.
+#[derive(Debug, Clone)]
+pub enum Backend {
+    /// Local Ollama server (default).
+    Ollama { url: String, model: String },
+    /// In-process ONNX embeddings via the `fastembed` crate.
+    #[cfg(feature = "fastembed")]
+    FastEmbed,
+}
+
+impl Backend {
+    /// Identifier stored in `meta.embed_model` so switching backend/model
+    /// discards incompatible cached vectors.
+    pub fn model_id(&self) -> String {
+        match self {
+            Backend::Ollama { model, .. } => model.clone(),
+            #[cfg(feature = "fastembed")]
+            Backend::FastEmbed => format!("fastembed:{}", fastembed::MODEL_ID),
+        }
+    }
+
+    /// Human-readable description for the startup line.
+    pub fn describe(&self) -> String {
+        match self {
+            Backend::Ollama { url, model } => format!("{model} via Ollama at {url}"),
+            #[cfg(feature = "fastembed")]
+            Backend::FastEmbed => {
+                format!("{} via fastembed (in-process ONNX)", fastembed::MODEL_ID)
+            }
+        }
+    }
+
+    /// Construct the embedder. Runs on the worker thread; may download a model
+    /// or initialize a runtime, so it can fail.
+    pub fn build(&self) -> Result<Box<dyn Embedder>, EmbedError> {
+        match self {
+            Backend::Ollama { url, model } => {
+                Ok(Box::new(ollama::OllamaEmbedder::new(url.clone(), model.clone())))
+            }
+            #[cfg(feature = "fastembed")]
+            Backend::FastEmbed => Ok(Box::new(fastembed::FastEmbedder::new()?)),
+        }
+    }
+}
 
 /// Why an embedding request failed. The distinction drives whether the worker
 /// aborts (the whole backend is down) or skips one chunk and carries on.

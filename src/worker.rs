@@ -1,8 +1,7 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::embed::ollama::OllamaEmbedder;
-use crate::embed::{EmbedError, Embedder};
+use crate::embed::{Backend, EmbedError};
 
 /// A message from the embedding worker back to the UI thread.
 pub enum WorkerMsg {
@@ -34,13 +33,20 @@ impl Worker {
 }
 
 /// Spawn the embedding worker. Embedding is CPU/network-bound, so it runs off
-/// the synchronous UI thread and reports results over a channel.
-pub fn spawn(ollama_url: String, model: String) -> Worker {
+/// the synchronous UI thread and reports results over a channel. The embedder
+/// is constructed inside the thread (it may download a model or init a runtime).
+pub fn spawn(backend: Backend) -> Worker {
     let (job_tx, job_rx) = channel::<Vec<(i64, String)>>();
     let (res_tx, res_rx) = channel::<WorkerMsg>();
 
     let handle = std::thread::spawn(move || {
-        let embedder = OllamaEmbedder::new(ollama_url, model);
+        let embedder = match backend.build() {
+            Ok(embedder) => embedder,
+            Err(err) => {
+                let _ = res_tx.send(WorkerMsg::Failed(err.to_string()));
+                return;
+            }
+        };
         while let Ok(batch) = job_rx.recv() {
             for (chunk_id, text) in batch {
                 let msg = match embedder.embed(&text) {

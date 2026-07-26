@@ -168,10 +168,10 @@ This means the right-hand "related notes" panel is useful from Phase 2, and embe
 - [x] Wire the background worker + channel so (re)indexing never blocks the UI.
 - [x] Merge semantic results into the related-notes list; gate rebuilds via the `meta` table.
 
-### Phase 4: Optional In-Process Backend & Polish
+### Phase 4: Optional In-Process Backend & Polish — mostly done
 
-- [ ] Add the feature-gated `FastEmbedder` (ONNX) for a no-daemon setup.
-- [ ] Cross-platform build/test on Linux, macOS, and Windows (note the `arboard`/X11 clipboard-on-exit quirk on Linux).
+- [x] Add the feature-gated `FastEmbedder` (ONNX `all-MiniLM-L6-v2`, 384-dim) for a no-daemon setup. Selected via `--embed-backend fastembed`; built with `--features fastembed`. Backend choice recorded in `meta.embed_model` so switching backends re-embeds.
+- [ ] Cross-platform build/test — verified on macOS (both default and `--features fastembed`). Linux/Windows still to confirm (note the `arboard`/X11 clipboard-on-exit quirk on Linux).
 
 ### Phase 5: External Enrichment (Optional / Experimental)
 

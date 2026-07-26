@@ -66,11 +66,11 @@ fn main() -> Result<()> {
 
     // Reconcile the embedding backend before loading, so a model change clears
     // stale vectors up front.
-    if config.embed_enabled {
-        store.reconcile_embedding_backend(&config.embed_model)?;
+    if let Some(backend) = &config.embed_backend {
+        store.reconcile_embedding_backend(&backend.model_id())?;
         eprintln!(
-            "Embeddings: {} via {} (computed in the background)",
-            config.embed_model, config.ollama_url
+            "Embeddings: {} (computed in the background)",
+            backend.describe()
         );
     }
 
@@ -106,9 +106,7 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
     let (_watch_handle, rx) = watch::watch(&config.vault)?;
 
     // Spawn the embedding worker and queue the initial backlog.
-    let worker = config
-        .embed_enabled
-        .then(|| worker::spawn(config.ollama_url.clone(), config.embed_model.clone()));
+    let worker = config.embed_backend.clone().map(worker::spawn);
     let mut embed_failed = false;
     if let Some(w) = &worker {
         submit_pending(store, w)?;

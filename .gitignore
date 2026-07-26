@@ -1,3 +1,5 @@
 /target
 # App state directory created inside a vault
 .constellate/
+# fastembed model cache (created in cwd when running with --features fastembed)
+.fastembed_cache/

@@ -17,3 +17,12 @@ arboard = "3"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Optional in-process ONNX embedding backend (no Ollama daemon required).
+# Heavy (pulls ONNX Runtime + tokenizers) and downloads the model on first use,
+# so it is off by default. Enable with `--features fastembed`.
+fastembed = { version = "5", optional = true }
+
+[features]
+default = []
+fastembed = ["dep:fastembed"]

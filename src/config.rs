@@ -4,9 +4,21 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 
 use crate::cli::Cli;
+use crate::embed::Backend;
 
 /// Name of the per-vault state directory. Excluded from the vault scan.
 pub const STATE_DIR: &str = ".constellate";
+
+/// Embedding backend chosen on the command line. Always parseable; selecting
+/// `Fastembed` without the `fastembed` feature is rejected at startup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum EmbedBackend {
+    /// Local Ollama server.
+    #[default]
+    Ollama,
+    /// In-process ONNX embeddings (requires `--features fastembed`).
+    Fastembed,
+}
 
 /// How a note reference is formatted when yanked to the clipboard.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -30,12 +42,8 @@ pub struct Config {
     pub log_path: PathBuf,
     /// Default format for clipboard note references.
     pub ref_format: RefFormat,
-    /// Whether semantic embeddings are enabled.
-    pub embed_enabled: bool,
-    /// Ollama embedding model.
-    pub embed_model: String,
-    /// Base URL of the Ollama server.
-    pub ollama_url: String,
+    /// The embedding backend, or `None` when embeddings are disabled.
+    pub embed_backend: Option<Backend>,
 }
 
 impl Config {
@@ -62,14 +70,39 @@ impl Config {
         // store already creates.
         let log_path = db_path.with_file_name("constellate.log");
 
+        let embed_backend = if cli.no_embed {
+            None
+        } else {
+            Some(resolve_backend(cli.embed_backend, cli.ollama_url, cli.embed_model)?)
+        };
+
         Ok(Config {
             vault,
             db_path,
             log_path,
             ref_format: cli.ref_format,
-            embed_enabled: !cli.no_embed,
-            embed_model: cli.embed_model,
-            ollama_url: cli.ollama_url,
+            embed_backend,
         })
+    }
+}
+
+fn resolve_backend(backend: EmbedBackend, ollama_url: String, model: String) -> Result<Backend> {
+    match backend {
+        EmbedBackend::Ollama => Ok(Backend::Ollama {
+            url: ollama_url,
+            model,
+        }),
+        EmbedBackend::Fastembed => {
+            #[cfg(feature = "fastembed")]
+            {
+                Ok(Backend::FastEmbed)
+            }
+            #[cfg(not(feature = "fastembed"))]
+            {
+                anyhow::bail!(
+                    "--embed-backend fastembed requires building with `--features fastembed`"
+                )
+            }
+        }
     }
 }
