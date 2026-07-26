@@ -23,13 +23,13 @@ pub enum EmbedBackend {
 /// How a note reference is formatted when yanked to the clipboard.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum RefFormat {
-    /// Path relative to the vault root, e.g. `subdir/note.md`.
+    /// Markdown link to the note, e.g. `[Title](subdir/note.md)`.
     #[default]
+    Markdown,
+    /// Path relative to the vault root, e.g. `subdir/note.md`.
     Relative,
     /// Absolute filesystem path.
     Absolute,
-    /// Obsidian-style `[[Title]]` wikilink.
-    Wikilink,
 }
 
 /// Resolved runtime configuration derived from CLI arguments and the environment.

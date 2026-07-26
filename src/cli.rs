@@ -17,7 +17,7 @@ pub struct Cli {
     pub db: Option<PathBuf>,
 
     /// Format used when yanking a note reference to the clipboard.
-    #[arg(long, value_enum, default_value = "relative")]
+    #[arg(long, value_enum, default_value = "markdown")]
     pub ref_format: RefFormat,
 
     /// Disable semantic embeddings (skip the backend; use only cheap relatedness).

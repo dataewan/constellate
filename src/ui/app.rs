@@ -200,9 +200,19 @@ impl App {
     fn current_reference(&self) -> Option<String> {
         let note = self.active_note()?;
         Some(match self.ref_format {
+            RefFormat::Markdown => {
+                let target = self.relative_path(&note.path);
+                // A destination containing spaces must be wrapped in <> to stay
+                // a valid CommonMark link.
+                let dest = if target.contains(' ') {
+                    format!("<{target}>")
+                } else {
+                    target
+                };
+                format!("[{}]({})", note.title, dest)
+            }
             RefFormat::Relative => self.relative_path(&note.path),
             RefFormat::Absolute => note.path.clone(),
-            RefFormat::Wikilink => format!("[[{}]]", note.title),
         })
     }
 
