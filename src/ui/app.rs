@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Text;
@@ -384,7 +384,14 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, n)| {
-                query.is_empty()
+                if query.is_empty() {
+                    return true;
+                }
+                let filename = Path::new(&n.path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                filename.contains(&query)
                     || n.title.to_lowercase().contains(&query)
                     || n.content.to_lowercase().contains(&query)
             })
