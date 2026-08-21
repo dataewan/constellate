@@ -235,6 +235,23 @@ pub fn build_provider(
     }
 }
 
+/// Renders an error together with its full source chain.
+///
+/// `reqwest`'s `Display` prints only the outermost layer (e.g. "error sending
+/// request for url (…)"), hiding the underlying cause — a missing TLS backend,
+/// DNS failure, connection refused, etc. Walking `source()` surfaces the part
+/// that actually says what went wrong.
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
+}
+
 fn require_key(kind: ProviderKind) -> Result<String, String> {
     let env = kind.key_env().expect("hosted backend has a key env var");
     std::env::var(env).map_err(|_| {

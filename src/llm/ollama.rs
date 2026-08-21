@@ -40,7 +40,7 @@ impl LlmProvider for OllamaProvider {
                 "stream": false,
             }))
             .send()
-            .map_err(|e| format!("requesting {endpoint}: {e}"))?
+            .map_err(|e| format!("requesting {endpoint}: {}", super::error_chain(&e)))?
             .error_for_status()
             .map_err(|e| format!("model returned an error: {e}"))?;
 

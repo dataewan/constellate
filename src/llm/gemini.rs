@@ -72,7 +72,7 @@ impl LlmProvider for GeminiProvider {
                 },
             }))
             .send()
-            .map_err(|e| format!("requesting Gemini: {e}"))?;
+            .map_err(|e| format!("requesting Gemini: {}", super::error_chain(&e)))?;
 
         if !response.status().is_success() {
             let status = response.status();

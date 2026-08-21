@@ -65,7 +65,7 @@ impl LlmProvider for ClaudeProvider {
                 "messages": [{ "role": "user", "content": prompt }],
             }))
             .send()
-            .map_err(|e| format!("requesting Claude: {e}"))?;
+            .map_err(|e| format!("requesting Claude: {}", super::error_chain(&e)))?;
 
         // Surface the API's error body rather than a bare status code.
         if !response.status().is_success() {
