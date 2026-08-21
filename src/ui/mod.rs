@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub use app::{LinkPrompt, PromptPickerView, RenamePrompt};
+pub use app::{ConfigView, LinkPrompt, PromptPickerView, RenamePrompt};
 
 /// Render the full three-pane layout plus a footer.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -51,6 +51,59 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(prompt) = app.rename_prompt() {
         render_rename_modal(f, &prompt);
     }
+    if let Some(view) = app.config_view() {
+        render_config_modal(f, &view);
+    }
+}
+
+fn render_config_modal(f: &mut Frame, view: &ConfigView) {
+    let area = centered_rect(60, 10, f.area());
+    f.render_widget(Clear, area);
+
+    // One line per row; the selected row is marked and the model row shows a
+    // caret while editing.
+    let rows = [
+        format!("Provider   {}", view.provider_label),
+        if view.editing_model {
+            format!("Model      {}▏", view.model)
+        } else {
+            format!("Model      {}", view.model)
+        },
+        format!("Prompts    {} preset(s)", view.prompt_count),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, text) in rows.iter().enumerate() {
+        let marker = if i == view.selected { "› " } else { "  " };
+        let style = if i == view.selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
+    }
+    lines.push(Line::from(""));
+    let hint = if view.editing_model {
+        "Type a model name · Enter save · Esc cancel"
+    } else {
+        "↑/↓ move · ←/→ change provider · Enter edit · Esc close"
+    };
+    lines.push(Line::from(hint.dim()));
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" LLM configuration ")
+                .border_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(modal, area);
 }
 
 fn render_rename_modal(f: &mut Frame, prompt: &RenamePrompt) {
@@ -70,7 +123,11 @@ fn render_rename_modal(f: &mut Frame, prompt: &RenamePrompt) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Rename note ")
-                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                .border_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(modal, area);
@@ -100,7 +157,11 @@ fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(" Send scratchpad to LLM ")
-                        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        .border_style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                 )
                 .highlight_style(selection_highlight())
                 .highlight_symbol("› ");
@@ -119,7 +180,11 @@ fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(" Send scratchpad to LLM ")
-                        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        .border_style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                 )
                 .wrap(Wrap { trim: true });
             f.render_widget(modal, area);
@@ -142,10 +207,20 @@ fn render_link_modal(f: &mut Frame, prompt: &LinkPrompt) {
     f.render_widget(Clear, area);
 
     let lines = vec![
-        Line::from(format!("Pair {}/{} — link these notes?", prompt.index, prompt.total)).bold(),
+        Line::from(format!(
+            "Pair {}/{} — link these notes?",
+            prompt.index, prompt.total
+        ))
+        .bold(),
         Line::from(""),
-        Line::from(vec![Span::from("A: ").dim(), Span::raw(prompt.a_name.clone())]),
-        Line::from(vec![Span::from("B: ").dim(), Span::raw(prompt.b_name.clone())]),
+        Line::from(vec![
+            Span::from("A: ").dim(),
+            Span::raw(prompt.a_name.clone()),
+        ]),
+        Line::from(vec![
+            Span::from("B: ").dim(),
+            Span::raw(prompt.b_name.clone()),
+        ]),
         Line::from(""),
         Line::from("[1] A → B      [2] B → A      [3] both"),
         Line::from("[4] skip       [Esc] cancel"),
@@ -156,7 +231,11 @@ fn render_link_modal(f: &mut Frame, prompt: &LinkPrompt) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Link notes ")
-                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                .border_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(modal, area);
@@ -279,8 +358,8 @@ fn render_scratchpad_commands(f: &mut Frame, area: Rect, accent: Color) {
         Line::from(vec![Span::styled("(l)", key), Span::raw(" Link notes")]),
         Line::from(vec![Span::styled("(s)", key), Span::raw(" Send to LLM")]),
     ];
-    let commands = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Commands "));
+    let commands =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Commands "));
     f.render_widget(commands, area);
 }
 
@@ -307,9 +386,12 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect, accent: Color) {
         Focus::Scratchpad => "j/k: select   x: remove",
     };
     let text = if !app.query.is_empty() {
-        format!("filtered: \"{}\"   Esc: clear   {move_hint}   /: search   q: quit", app.query)
+        format!(
+            "filtered: \"{}\"   Esc: clear   {move_hint}   /: search   q: quit",
+            app.query
+        )
     } else {
-        format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   r: rename   y: copy   /: search   q: quit")
+        format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   r: rename   c: config   y: copy   /: search   q: quit")
     };
     f.render_widget(Paragraph::new(Line::from(text).dim()), area);
 }

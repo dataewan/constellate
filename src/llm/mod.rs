@@ -1,12 +1,17 @@
 //! Scratchpad → LLM synthesis: concatenate the scratchpad notes, ask a chosen
 //! prompt, and write the result to a new `#TODO` note in the vault root.
+//!
+//! The actual model call is delegated to an [`LlmProvider`] (Ollama by default,
+//! or the hosted Claude / Gemini backends), so the synthesis pipeline is
+//! independent of which model produces the text.
+
+mod claude;
+mod gemini;
+mod ollama;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use reqwest::blocking::Client;
-use serde::Deserialize;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::linking;
 
@@ -15,7 +20,8 @@ use crate::linking;
 const MAX_NOTE_CHARS: usize = 8000;
 
 /// The preset prompt library: (label, prompt text). A "Custom…" entry is
-/// offered by the UI in addition to these.
+/// offered by the UI in addition to these. Used to seed the DB-backed prompt
+/// library on first run.
 pub const PROMPTS: &[(&str, &str)] = &[
     (
         "Connections",
@@ -43,6 +49,119 @@ pub const PROMPTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Which LLM backend to use for synthesis. Persisted in the `meta` table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// Local Ollama server (default; no API key).
+    Ollama,
+    /// Anthropic Claude (Messages API; needs `ANTHROPIC_API_KEY`).
+    Claude,
+    /// Google Gemini (generateContent; needs `GEMINI_API_KEY`).
+    Gemini,
+}
+
+impl ProviderKind {
+    /// The stable string used in the `meta` table / CLI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Ollama => "ollama",
+            ProviderKind::Claude => "claude",
+            ProviderKind::Gemini => "gemini",
+        }
+    }
+
+    /// Parse the stored / CLI string, if recognized.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ollama" => Some(ProviderKind::Ollama),
+            "claude" | "anthropic" => Some(ProviderKind::Claude),
+            "gemini" | "google" => Some(ProviderKind::Gemini),
+            _ => None,
+        }
+    }
+
+    /// A sensible default model for this backend, used to seed config.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            ProviderKind::Ollama => "qwen2.5",
+            ProviderKind::Claude => "claude-opus-4-8",
+            ProviderKind::Gemini => "gemini-2.5-flash",
+        }
+    }
+
+    /// The environment variable a hosted backend reads its API key from, if any.
+    pub fn key_env(self) -> Option<&'static str> {
+        match self {
+            ProviderKind::Ollama => None,
+            ProviderKind::Claude => Some("ANTHROPIC_API_KEY"),
+            ProviderKind::Gemini => Some("GEMINI_API_KEY"),
+        }
+    }
+
+    /// Human-readable label for the config modal.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderKind::Ollama => "Ollama (local)",
+            ProviderKind::Claude => "Claude (hosted)",
+            ProviderKind::Gemini => "Gemini (hosted)",
+        }
+    }
+
+    /// All backends, in modal display order.
+    pub const ALL: [ProviderKind; 3] = [
+        ProviderKind::Ollama,
+        ProviderKind::Claude,
+        ProviderKind::Gemini,
+    ];
+}
+
+/// A model backend that turns a prompt into text. Constructed on the synthesis
+/// thread, so it must be `Send`.
+pub trait LlmProvider: Send {
+    /// Run the model on `prompt`, returning the generated text or an error
+    /// message suitable for the status line / log.
+    fn generate(&self, prompt: &str) -> Result<String, String>;
+}
+
+/// Build the provider for `kind`, reading any required API key from the
+/// environment. Fails with a clear message when a hosted key is missing.
+pub fn build_provider(
+    kind: ProviderKind,
+    model: &str,
+    ollama_url: &str,
+) -> Result<Box<dyn LlmProvider>, String> {
+    match kind {
+        ProviderKind::Ollama => Ok(Box::new(ollama::OllamaProvider::new(
+            ollama_url.to_string(),
+            model.to_string(),
+        ))),
+        ProviderKind::Claude => {
+            let key = require_key(kind)?;
+            Ok(Box::new(claude::ClaudeProvider::new(
+                key,
+                model.to_string(),
+            )))
+        }
+        ProviderKind::Gemini => {
+            let key = require_key(kind)?;
+            Ok(Box::new(gemini::GeminiProvider::new(
+                key,
+                model.to_string(),
+            )))
+        }
+    }
+}
+
+fn require_key(kind: ProviderKind) -> Result<String, String> {
+    let env = kind.key_env().expect("hosted backend has a key env var");
+    std::env::var(env).map_err(|_| {
+        format!(
+            "{} requires the {env} environment variable to be set",
+            kind.label()
+        )
+    })
+}
+
 /// A synthesis job: the chosen prompt plus the scratchpad notes to feed in.
 pub struct SynthesisRequest {
     pub prompt_text: String,
@@ -51,16 +170,15 @@ pub struct SynthesisRequest {
 }
 
 /// Run a synthesis end to end on the calling (worker) thread: read the notes,
-/// call the model, and write the output note. Returns the created file path, or
-/// an error message suitable for the status line / log.
+/// call the model via `provider`, and write the output note. Returns the created
+/// file path, or an error message suitable for the status line / log.
 pub fn run_synthesis(
-    url: &str,
-    model: &str,
+    provider: &dyn LlmProvider,
     vault: &Path,
     request: &SynthesisRequest,
 ) -> Result<PathBuf, String> {
     let prompt = build_prompt(&request.sources, &request.prompt_text)?;
-    let output = generate(url, model, &prompt)?;
+    let output = provider.generate(&prompt)?;
     write_synthesis(vault, &request.sources, &output)
 }
 
@@ -79,37 +197,6 @@ fn build_prompt(sources: &[(PathBuf, String)], question: &str) -> Result<String,
          Task: {question}\n\n\
          Write a clear, well-structured Markdown response."
     ))
-}
-
-#[derive(Deserialize)]
-struct GenerateResponse {
-    response: String,
-}
-
-fn generate(url: &str, model: &str, prompt: &str) -> Result<String, String> {
-    let endpoint = format!("{}/api/generate", url.trim_end_matches('/'));
-    let client = Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .post(&endpoint)
-        .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": false }))
-        .send()
-        .map_err(|e| format!("requesting {endpoint}: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("model returned an error: {e}"))?;
-
-    let body: GenerateResponse = response
-        .json()
-        .map_err(|e| format!("decoding response: {e}"))?;
-
-    let text = body.response.trim().to_string();
-    if text.is_empty() {
-        return Err("model returned an empty response".to_string());
-    }
-    Ok(text)
 }
 
 /// Write the synthesis note to the vault root: `#TODO`, then links to the
@@ -240,7 +327,10 @@ mod tests {
 
     #[test]
     fn strips_leading_zettelkasten_id() {
-        assert_eq!(strip_leading_id("202111211733-tony-blair-lack"), "tony-blair-lack");
+        assert_eq!(
+            strip_leading_id("202111211733-tony-blair-lack"),
+            "tony-blair-lack"
+        );
         assert_eq!(strip_leading_id("20211121_foo"), "foo");
         assert_eq!(strip_leading_id("3-ideas"), "3-ideas"); // short number kept
         assert_eq!(strip_leading_id("plain-note"), "plain-note");
@@ -258,6 +348,25 @@ mod tests {
         // 2021-01-01 00:00:00 UTC.
         assert_eq!(timestamp_id(1_609_459_200), "202101010000");
         // + 17h33m.
-        assert_eq!(timestamp_id(1_609_459_200 + 17 * 3600 + 33 * 60), "202101011733");
+        assert_eq!(
+            timestamp_id(1_609_459_200 + 17 * 3600 + 33 * 60),
+            "202101011733"
+        );
+    }
+
+    #[test]
+    fn provider_kind_roundtrip() {
+        for kind in ProviderKind::ALL {
+            assert_eq!(ProviderKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ProviderKind::parse("anthropic"), Some(ProviderKind::Claude));
+        assert_eq!(ProviderKind::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn hosted_backends_need_a_key_env() {
+        assert_eq!(ProviderKind::Ollama.key_env(), None);
+        assert_eq!(ProviderKind::Claude.key_env(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(ProviderKind::Gemini.key_env(), Some("GEMINI_API_KEY"));
     }
 }

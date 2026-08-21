@@ -8,7 +8,7 @@ use crate::config::RefFormat;
 use crate::db::store::NoteRow;
 use crate::embed::SemanticIndex;
 use crate::linking;
-use crate::llm::{self, SynthesisRequest};
+use crate::llm::{self, ProviderKind, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::rename;
 use crate::ui::markdown;
@@ -55,7 +55,12 @@ pub enum Action {
     /// Run an LLM synthesis over the scratchpad on a background thread.
     GenerateSynthesis(SynthesisRequest),
     /// Rename the active note's slug to `new_slug` (keeping its timestamp).
-    RenameNote { path: PathBuf, new_slug: String },
+    RenameNote {
+        path: PathBuf,
+        new_slug: String,
+    },
+    /// The LLM provider/model config changed and should be persisted.
+    LlmConfigChanged,
 }
 
 /// The scratchpad → LLM prompt picker: choose a preset or enter a custom prompt.
@@ -68,8 +73,13 @@ struct PromptPicker {
 
 /// Read-only view of the prompt picker, for rendering the modal.
 pub enum PromptPickerView {
-    List { labels: Vec<String>, selected: usize },
-    Custom { text: String },
+    List {
+        labels: Vec<String>,
+        selected: usize,
+    },
+    Custom {
+        text: String,
+    },
 }
 
 /// A candidate pair of notes to offer a link between, during the linking flow.
@@ -89,6 +99,30 @@ struct LinkingState {
     index: usize,
     created: usize,
     modified: Vec<String>,
+}
+
+/// Rows in the LLM config modal.
+const CONFIG_ROWS: usize = 3;
+const CONFIG_ROW_PROVIDER: usize = 0;
+const CONFIG_ROW_MODEL: usize = 1;
+const CONFIG_ROW_PROMPTS: usize = 2;
+
+/// State of the open LLM config modal.
+struct ConfigModal {
+    /// Highlighted row (0 provider, 1 model, 2 prompts).
+    selected: usize,
+    /// `Some(buffer)` while the model field is being edited.
+    editing_model: Option<String>,
+}
+
+/// Read-only snapshot of the config modal, for rendering.
+pub struct ConfigView {
+    pub provider_label: &'static str,
+    /// The model for the selected provider (the edit buffer while editing).
+    pub model: String,
+    pub editing_model: bool,
+    pub selected: usize,
+    pub prompt_count: usize,
 }
 
 /// An in-progress "rename this note" session: the note being renamed and the
@@ -165,6 +199,12 @@ pub struct App {
     prompt_picker: Option<PromptPicker>,
     /// In-progress rename-the-active-note session, if any.
     renaming: Option<RenameState>,
+    /// Open LLM config modal, if any.
+    config_modal: Option<ConfigModal>,
+    /// Index into `ProviderKind::ALL` of the active provider.
+    llm_provider_idx: usize,
+    /// The model for each provider, in `ProviderKind::ALL` order.
+    llm_models: [String; 3],
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
@@ -201,6 +241,13 @@ impl App {
             linking: None,
             prompt_picker: None,
             renaming: None,
+            config_modal: None,
+            llm_provider_idx: 0,
+            llm_models: [
+                ProviderKind::ALL[0].default_model().to_string(),
+                ProviderKind::ALL[1].default_model().to_string(),
+                ProviderKind::ALL[2].default_model().to_string(),
+            ],
             status: None,
         };
         app.refilter();
@@ -216,7 +263,11 @@ impl App {
         self.notes = notes;
         self.refilter();
         if let Some(path) = current {
-            if let Some(pos) = self.filtered.iter().position(|&i| self.notes[i].path == path) {
+            if let Some(pos) = self
+                .filtered
+                .iter()
+                .position(|&i| self.notes[i].path == path)
+            {
                 self.selected = pos;
                 self.sync_list_state();
             }
@@ -291,7 +342,10 @@ impl App {
     /// the anchor.
     pub fn active_note(&self) -> Option<&NoteRow> {
         let highlighted = match self.focus {
-            Focus::Related => self.related.get(self.related_selected).map(|r| r.path.as_str()),
+            Focus::Related => self
+                .related
+                .get(self.related_selected)
+                .map(|r| r.path.as_str()),
             Focus::Scratchpad => self
                 .scratchpad
                 .get(self.scratchpad_selected)
@@ -308,7 +362,8 @@ impl App {
 
     /// Path of the active note relative to the vault root, for display.
     pub fn current_relative_path(&self) -> Option<String> {
-        self.active_note().map(|note| self.relative_path(&note.path))
+        self.active_note()
+            .map(|note| self.relative_path(&note.path))
     }
 
     fn relative_path(&self, path: &str) -> String {
@@ -353,6 +408,9 @@ impl App {
         }
         if self.renaming.is_some() {
             return self.handle_rename_key(key);
+        }
+        if self.config_modal.is_some() {
+            return self.handle_config_key(key);
         }
 
         if self.searching {
@@ -416,6 +474,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.start_rename(),
+            KeyCode::Char('c') => self.open_config(),
             _ => {}
         }
         Action::None
@@ -675,20 +734,160 @@ impl App {
         }
     }
 
-    /// A read-only snapshot of the prompt picker, for rendering.
-    pub fn prompt_picker_view(&self) -> Option<PromptPickerView> {
-        self.prompt_picker.as_ref().map(|picker| match &picker.custom {
-            Some(text) => PromptPickerView::Custom { text: text.clone() },
-            None => {
-                let mut labels: Vec<String> =
-                    llm::PROMPTS.iter().map(|(l, _)| (*l).to_string()).collect();
-                labels.push("Custom…".to_string());
-                PromptPickerView::List {
-                    labels,
-                    selected: picker.selected,
+    /// Install the resolved LLM provider selection and per-provider models
+    /// (called once at startup, after reading CLI + DB config).
+    pub fn set_llm_config(&mut self, provider: ProviderKind, models: [String; 3]) {
+        self.llm_provider_idx = ProviderKind::ALL
+            .iter()
+            .position(|&k| k == provider)
+            .unwrap_or(0);
+        self.llm_models = models;
+    }
+
+    /// The active provider and its model, for a synthesis run.
+    pub fn llm_selection(&self) -> (ProviderKind, String) {
+        (
+            ProviderKind::ALL[self.llm_provider_idx],
+            self.llm_models[self.llm_provider_idx].clone(),
+        )
+    }
+
+    /// The full config to persist: active provider plus every provider's model.
+    pub fn llm_config_for_persist(&self) -> (ProviderKind, [(ProviderKind, String); 3]) {
+        let models = [
+            (ProviderKind::ALL[0], self.llm_models[0].clone()),
+            (ProviderKind::ALL[1], self.llm_models[1].clone()),
+            (ProviderKind::ALL[2], self.llm_models[2].clone()),
+        ];
+        (ProviderKind::ALL[self.llm_provider_idx], models)
+    }
+
+    /// A read-only snapshot of the config modal, for rendering.
+    pub fn config_view(&self) -> Option<ConfigView> {
+        self.config_modal.as_ref().map(|m| ConfigView {
+            provider_label: ProviderKind::ALL[self.llm_provider_idx].label(),
+            model: m
+                .editing_model
+                .clone()
+                .unwrap_or_else(|| self.llm_models[self.llm_provider_idx].clone()),
+            editing_model: m.editing_model.is_some(),
+            selected: m.selected,
+            prompt_count: llm::PROMPTS.len(),
+        })
+    }
+
+    /// Open the LLM config modal.
+    fn open_config(&mut self) {
+        self.config_modal = Some(ConfigModal {
+            selected: CONFIG_ROW_PROVIDER,
+            editing_model: None,
+        });
+    }
+
+    /// Handle a key while the config modal is open.
+    fn handle_config_key(&mut self, key: KeyEvent) -> Action {
+        // Editing the model text field captures all input.
+        if let Some(buf) = self
+            .config_modal
+            .as_ref()
+            .and_then(|m| m.editing_model.clone())
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(m) = self.config_modal.as_mut() {
+                        m.editing_model = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    let model = buf.trim().to_string();
+                    if let Some(m) = self.config_modal.as_mut() {
+                        m.editing_model = None;
+                    }
+                    if !model.is_empty() {
+                        self.llm_models[self.llm_provider_idx] = model;
+                        return Action::LlmConfigChanged;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(m) = self.config_modal.as_mut() {
+                        if let Some(b) = m.editing_model.as_mut() {
+                            b.pop();
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(m) = self.config_modal.as_mut() {
+                        if let Some(b) = m.editing_model.as_mut() {
+                            b.push(c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.config_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(m) = self.config_modal.as_mut() {
+                    m.selected = (m.selected + CONFIG_ROWS - 1) % CONFIG_ROWS;
                 }
             }
-        })
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(m) = self.config_modal.as_mut() {
+                    m.selected = (m.selected + 1) % CONFIG_ROWS;
+                }
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                let selected = self.config_modal.as_ref().map(|m| m.selected);
+                if selected == Some(CONFIG_ROW_PROVIDER) {
+                    let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                    self.llm_provider_idx = if forward {
+                        (self.llm_provider_idx + 1) % ProviderKind::ALL.len()
+                    } else {
+                        (self.llm_provider_idx + ProviderKind::ALL.len() - 1)
+                            % ProviderKind::ALL.len()
+                    };
+                    return Action::LlmConfigChanged;
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.config_modal.as_ref().map(|m| m.selected);
+                match selected {
+                    Some(CONFIG_ROW_MODEL) => {
+                        let current = self.llm_models[self.llm_provider_idx].clone();
+                        if let Some(m) = self.config_modal.as_mut() {
+                            m.editing_model = Some(current);
+                        }
+                    }
+                    Some(CONFIG_ROW_PROMPTS) => {
+                        self.set_status("Editing prompts comes in a later update.");
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// A read-only snapshot of the prompt picker, for rendering.
+    pub fn prompt_picker_view(&self) -> Option<PromptPickerView> {
+        self.prompt_picker
+            .as_ref()
+            .map(|picker| match &picker.custom {
+                Some(text) => PromptPickerView::Custom { text: text.clone() },
+                None => {
+                    let mut labels: Vec<String> =
+                        llm::PROMPTS.iter().map(|(l, _)| (*l).to_string()).collect();
+                    labels.push("Custom…".to_string());
+                    PromptPickerView::List {
+                        labels,
+                        selected: picker.selected,
+                    }
+                }
+            })
     }
 
     /// Open the prompt picker for LLM synthesis over the scratchpad.
@@ -895,7 +1094,11 @@ impl App {
 
     /// Make the highlighted related note the current note.
     fn jump_to_related(&mut self) {
-        if let Some(target) = self.related.get(self.related_selected).map(|r| r.path.clone()) {
+        if let Some(target) = self
+            .related
+            .get(self.related_selected)
+            .map(|r| r.path.clone())
+        {
             self.jump_to_path(&target);
         }
     }
@@ -916,7 +1119,11 @@ impl App {
             self.searching = false;
             self.refilter();
         }
-        if let Some(pos) = self.filtered.iter().position(|&i| self.notes[i].path == path) {
+        if let Some(pos) = self
+            .filtered
+            .iter()
+            .position(|&i| self.notes[i].path == path)
+        {
             self.selected = pos;
             self.sync_list_state();
         }

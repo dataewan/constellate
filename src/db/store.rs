@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
+use crate::llm::ProviderKind;
 use crate::vault::ParsedNote;
 
 /// A note loaded for browsing, searching, preview, and relatedness.
@@ -135,6 +136,29 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// The persisted LLM provider selection, if the user has chosen one.
+    pub fn llm_provider(&self) -> Result<Option<ProviderKind>> {
+        Ok(self
+            .meta_get("llm_provider")?
+            .and_then(|s| ProviderKind::parse(&s)))
+    }
+
+    /// The persisted model for a given provider, if set (stored per-provider so
+    /// switching backends remembers each one's model).
+    pub fn llm_model(&self, kind: ProviderKind) -> Result<Option<String>> {
+        self.meta_get(&format!("llm_model_{}", kind.as_str()))
+    }
+
+    /// Persist the active LLM provider.
+    pub fn set_llm_provider(&self, kind: ProviderKind) -> Result<()> {
+        self.meta_set("llm_provider", kind.as_str())
+    }
+
+    /// Persist the model for a given provider.
+    pub fn set_llm_model(&self, kind: ProviderKind, model: &str) -> Result<()> {
+        self.meta_set(&format!("llm_model_{}", kind.as_str()), model)
     }
 
     /// Ensure stored embeddings match the active backend/model. If the model
@@ -288,8 +312,9 @@ impl Store {
             .collect();
 
         let mut tag_stmt = self.conn.prepare("SELECT note_path, tag FROM tags")?;
-        let tag_rows = tag_stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let tag_rows = tag_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for row in tag_rows {
             let (path, tag) = row?;
             if let Some(&i) = index.get(&path) {
@@ -298,8 +323,9 @@ impl Store {
         }
 
         let mut link_stmt = self.conn.prepare("SELECT note_path, target FROM links")?;
-        let link_rows = link_stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let link_rows = link_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for row in link_rows {
             let (path, target) = row?;
             if let Some(&i) = index.get(&path) {
@@ -355,7 +381,10 @@ mod tests {
 
         store.upsert_note(&note, &hash).unwrap();
         assert_eq!(store.all_notes().unwrap().len(), 1);
-        assert_eq!(store.stored_hash("/vault/a.md").unwrap().as_deref(), Some(hash.as_str()));
+        assert_eq!(
+            store.stored_hash("/vault/a.md").unwrap().as_deref(),
+            Some(hash.as_str())
+        );
 
         // Re-writing replaces cleanly (no duplicate chunks/links/tags).
         store.upsert_note(&note, &hash).unwrap();
@@ -364,6 +393,36 @@ mod tests {
         store.delete_note("/vault/a.md").unwrap();
         assert!(store.all_notes().unwrap().is_empty());
         assert!(store.stored_hash("/vault/a.md").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn llm_config_roundtrip() {
+        let db = temp_db();
+        let store = Store::open(&db).unwrap();
+
+        // Unset by default.
+        assert_eq!(store.llm_provider().unwrap(), None);
+        assert_eq!(store.llm_model(ProviderKind::Claude).unwrap(), None);
+
+        store.set_llm_provider(ProviderKind::Claude).unwrap();
+        store
+            .set_llm_model(ProviderKind::Claude, "claude-sonnet-5")
+            .unwrap();
+        store.set_llm_model(ProviderKind::Ollama, "llama3").unwrap();
+
+        assert_eq!(store.llm_provider().unwrap(), Some(ProviderKind::Claude));
+        assert_eq!(
+            store.llm_model(ProviderKind::Claude).unwrap().as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // Models are stored per-provider and don't collide.
+        assert_eq!(
+            store.llm_model(ProviderKind::Ollama).unwrap().as_deref(),
+            Some("llama3")
+        );
+        assert_eq!(store.llm_model(ProviderKind::Gemini).unwrap(), None);
 
         let _ = std::fs::remove_file(&db);
     }

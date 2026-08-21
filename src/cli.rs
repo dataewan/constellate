@@ -36,7 +36,13 @@ pub struct Cli {
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_url: String,
 
-    /// Ollama chat model used for scratchpad LLM synthesis (the `s` command).
-    #[arg(long, default_value = "qwen2.5")]
-    pub llm_model: String,
+    /// LLM provider for scratchpad synthesis: `ollama`, `claude`, or `gemini`.
+    /// Overrides the value stored in the database for this run.
+    #[arg(long)]
+    pub llm_provider: Option<String>,
+
+    /// Chat model for the active provider (the `s` command). Overrides the
+    /// database value for this run; otherwise the stored / default model is used.
+    #[arg(long)]
+    pub llm_model: Option<String>,
 }
