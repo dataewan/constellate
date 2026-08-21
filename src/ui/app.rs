@@ -10,6 +10,7 @@ use crate::embed::SemanticIndex;
 use crate::linking;
 use crate::llm::{self, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
+use crate::rename;
 use crate::ui::markdown;
 
 /// Which pane currently receives navigation keys.
@@ -53,6 +54,8 @@ pub enum Action {
     ReindexPaths(Vec<String>),
     /// Run an LLM synthesis over the scratchpad on a background thread.
     GenerateSynthesis(SynthesisRequest),
+    /// Rename the active note's slug to `new_slug` (keeping its timestamp).
+    RenameNote { path: PathBuf, new_slug: String },
 }
 
 /// The scratchpad → LLM prompt picker: choose a preset or enter a custom prompt.
@@ -86,6 +89,22 @@ struct LinkingState {
     index: usize,
     created: usize,
     modified: Vec<String>,
+}
+
+/// An in-progress "rename this note" session: the note being renamed and the
+/// editable slug buffer (the timestamp prefix is fixed and not part of it).
+struct RenameState {
+    path: PathBuf,
+    prefix: String,
+    slug: String,
+}
+
+/// Read-only snapshot of the rename modal, for rendering.
+pub struct RenamePrompt {
+    /// The fixed `YYYYMMDDHHMM` prefix, shown before the editable slug.
+    pub prefix: String,
+    /// The current editable slug text.
+    pub slug: String,
 }
 
 /// Read-only snapshot of the current link prompt, for rendering the modal.
@@ -144,6 +163,8 @@ pub struct App {
     linking: Option<LinkingState>,
     /// Open prompt picker for LLM synthesis, if any.
     prompt_picker: Option<PromptPicker>,
+    /// In-progress rename-the-active-note session, if any.
+    renaming: Option<RenameState>,
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
@@ -179,6 +200,7 @@ impl App {
             scratchpad_state: ListState::default(),
             linking: None,
             prompt_picker: None,
+            renaming: None,
             status: None,
         };
         app.refilter();
@@ -329,6 +351,9 @@ impl App {
         if self.prompt_picker.is_some() {
             return self.handle_prompt_key(key);
         }
+        if self.renaming.is_some() {
+            return self.handle_rename_key(key);
+        }
 
         if self.searching {
             match key.code {
@@ -390,6 +415,7 @@ impl App {
                     return Action::OpenEditor(PathBuf::from(&note.path));
                 }
             }
+            KeyCode::Char('r') => self.start_rename(),
             _ => {}
         }
         Action::None
@@ -569,6 +595,83 @@ impl App {
             Action::None
         } else {
             Action::ReindexPaths(state.modified)
+        }
+    }
+
+    /// A read-only snapshot of the rename modal, for rendering.
+    pub fn rename_prompt(&self) -> Option<RenamePrompt> {
+        self.renaming.as_ref().map(|state| RenamePrompt {
+            prefix: state.prefix.clone(),
+            slug: state.slug.clone(),
+        })
+    }
+
+    /// Open the rename modal for the active note, prefilled with its current slug.
+    /// Only timestamped Zettel notes are renameable (issue #1).
+    fn start_rename(&mut self) {
+        let Some(path) = self.active_note().map(|n| n.path.clone()) else {
+            return;
+        };
+        if !rename::is_renameable(&path) {
+            self.set_status("Only timestamped notes (YYYYMMDDHHMM-…) can be renamed.");
+            return;
+        }
+        let prefix = Path::new(&path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|stem| rename::split_zettel(stem).map(|(p, _)| p.to_string()))
+            .unwrap_or_default();
+        let slug = rename::current_slug(&path).unwrap_or_default();
+        self.renaming = Some(RenameState {
+            path: PathBuf::from(path),
+            prefix,
+            slug,
+        });
+    }
+
+    /// Handle a key while the rename modal is open.
+    fn handle_rename_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => self.renaming = None,
+            KeyCode::Backspace => {
+                if let Some(state) = self.renaming.as_mut() {
+                    state.slug.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(state) = self.renaming.as_mut() {
+                    state.slug.push(c);
+                }
+            }
+            KeyCode::Enter => {
+                let Some(state) = self.renaming.take() else {
+                    return Action::None;
+                };
+                let new_slug = state.slug.trim().to_string();
+                if new_slug.is_empty() {
+                    self.set_status("Rename cancelled — name was empty.");
+                    return Action::None;
+                }
+                return Action::RenameNote {
+                    path: state.path,
+                    new_slug,
+                };
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// After a successful rename, retarget the selection and scratchpad from the
+    /// old path to the new one so the view follows the renamed note.
+    pub fn note_renamed(&mut self, old_path: &str, new_path: &str) {
+        for entry in self.scratchpad.iter_mut() {
+            if entry == old_path {
+                *entry = new_path.to_string();
+            }
+        }
+        if self.related_basis.as_deref() == Some(old_path) {
+            self.related_basis = Some(new_path.to_string());
         }
     }
 
@@ -795,6 +898,12 @@ impl App {
         if let Some(target) = self.related.get(self.related_selected).map(|r| r.path.clone()) {
             self.jump_to_path(&target);
         }
+    }
+
+    /// Focus the notes list on `path` if it is indexed (e.g. after a rename).
+    pub fn focus_path(&mut self, path: &str) {
+        self.focus = Focus::Notes;
+        self.jump_to_path(path);
     }
 
     fn jump_to_path(&mut self, path: &str) {

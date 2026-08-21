@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub use app::{LinkPrompt, PromptPickerView};
+pub use app::{LinkPrompt, PromptPickerView, RenamePrompt};
 
 /// Render the full three-pane layout plus a footer.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -48,6 +48,32 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(view) = app.prompt_picker_view() {
         render_prompt_modal(f, &view);
     }
+    if let Some(prompt) = app.rename_prompt() {
+        render_rename_modal(f, &prompt);
+    }
+}
+
+fn render_rename_modal(f: &mut Frame, prompt: &RenamePrompt) {
+    let area = centered_rect(60, 7, f.area());
+    f.render_widget(Clear, area);
+    let lines = vec![
+        Line::from("Rename note (Enter to confirm · Esc to cancel):".dim()),
+        Line::from("The timestamp is kept; only the name after it changes.".dim()),
+        Line::from(""),
+        Line::from(vec![
+            Span::from(format!("{}-", prompt.prefix)).fg(Color::DarkGray),
+            Span::from(format!("{}▏", prompt.slug)),
+        ]),
+    ];
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Rename note ")
+                .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(modal, area);
 }
 
 fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
@@ -283,7 +309,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect, accent: Color) {
     let text = if !app.query.is_empty() {
         format!("filtered: \"{}\"   Esc: clear   {move_hint}   /: search   q: quit", app.query)
     } else {
-        format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   y: copy   /: search   q: quit")
+        format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   r: rename   y: copy   /: search   q: quit")
     };
     f.render_widget(Paragraph::new(Line::from(text).dim()), area);
 }

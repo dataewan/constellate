@@ -8,6 +8,7 @@ mod linking;
 mod llm;
 mod logging;
 mod related;
+mod rename;
 mod ui;
 mod vault;
 mod watch;
@@ -251,6 +252,36 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                         });
                         synthesis = Some(rx);
                         app.set_status(format!("Generating synthesis with {}…", config.llm_model));
+                    }
+                }
+                Action::RenameNote { path, new_slug } => {
+                    let notes = store.all_notes()?;
+                    match rename::rename(&path, &new_slug, &notes) {
+                        Ok(outcome) => {
+                            // Re-index the vanished old path, the new file, and
+                            // every source whose links were rewritten.
+                            let mut paths: Vec<PathBuf> = vec![
+                                PathBuf::from(&outcome.old_path),
+                                PathBuf::from(&outcome.new_path),
+                            ];
+                            paths.extend(outcome.rewritten.iter().map(PathBuf::from));
+                            app.note_renamed(&outcome.old_path, &outcome.new_path);
+                            if vault::sync_paths(store, &config.vault, &paths)? {
+                                let notes = store.all_notes()?;
+                                let semantic = build_semantic(store, &notes)?;
+                                app.set_notes(notes);
+                                app.set_semantic(semantic);
+                                if let Some(w) = &worker {
+                                    if !embed_failed {
+                                        submit_pending(store, w)?;
+                                    }
+                                }
+                            }
+                            store.save_scratchpad(app.scratchpad_paths())?;
+                            app.focus_path(&outcome.new_path);
+                            app.set_status("Renamed note.");
+                        }
+                        Err(err) => app.set_status(format!("Rename failed: {err}")),
                     }
                 }
                 Action::ReindexPaths(paths) => {
