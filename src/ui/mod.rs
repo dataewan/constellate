@@ -1,7 +1,9 @@
 pub mod app;
 pub mod markdown;
+pub mod textinput;
 
 pub use app::{Action, App, Focus};
+use textinput::InputView;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -92,20 +94,20 @@ fn render_prompt_admin(f: &mut Frame, view: &PromptAdminView) {
             editing_label,
         } => {
             let label_line = if *editing_label {
-                Line::from(vec![
-                    Span::from("Label  ").fg(Color::Cyan),
-                    Span::from(format!("{label}▏")),
-                ])
+                input_spans(vec![Span::from("Label  ").fg(Color::Cyan)], label)
             } else {
-                Line::from(vec![Span::from("Label  ").dim(), Span::from(label.clone())])
+                Line::from(vec![
+                    Span::from("Label  ").dim(),
+                    Span::from(label.text.clone()),
+                ])
             };
             let text_line = if *editing_label {
-                Line::from(vec![Span::from("Prompt ").dim(), Span::from(text.clone())])
-            } else {
                 Line::from(vec![
-                    Span::from("Prompt ").fg(Color::Cyan),
-                    Span::from(format!("{text}▏")),
+                    Span::from("Prompt ").dim(),
+                    Span::from(text.text.clone()),
                 ])
+            } else {
+                input_spans(vec![Span::from("Prompt ").fg(Color::Cyan)], text)
             };
             let heading = if *adding { "Add prompt" } else { "Edit prompt" };
             (
@@ -144,21 +146,18 @@ fn render_config_modal(f: &mut Frame, view: &ConfigView) {
     let area = centered_rect(60, 11, f.area());
     f.render_widget(Clear, area);
 
-    // One line per row; the selected row is marked and the model row shows a
-    // caret while editing.
+    // One line per row; the selected row is marked. The model row shows a live
+    // cursor (via `input_spans`) while it is being edited.
     let rows = [
         format!("Provider   {}", view.provider_label),
-        if view.editing_model {
-            format!("Model      {}▏", view.model)
-        } else {
-            format!("Model      {}", view.model)
-        },
+        format!("Model      {}", view.model),
         match view.effort {
             Some(label) => format!("Effort     {label}"),
             None => "Effort     — (not supported)".to_string(),
         },
         format!("Prompts    {} preset(s)", view.prompt_count),
     ];
+    const MODEL_ROW: usize = 1;
     let mut lines: Vec<Line> = Vec::new();
     for (i, text) in rows.iter().enumerate() {
         let marker = if i == view.selected { "› " } else { "  " };
@@ -169,6 +168,15 @@ fn render_config_modal(f: &mut Frame, view: &ConfigView) {
         } else {
             Style::default()
         };
+        if i == MODEL_ROW {
+            if let Some(input) = &view.model_input {
+                lines.push(input_spans(
+                    vec![Span::styled(format!("{marker}Model      "), style)],
+                    input,
+                ));
+                continue;
+            }
+        }
         lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
     }
     lines.push(Line::from(""));
@@ -201,10 +209,10 @@ fn render_rename_modal(f: &mut Frame, prompt: &RenamePrompt) {
         Line::from("Rename note (Enter to confirm · Esc to cancel):".dim()),
         Line::from("The timestamp is kept; only the name after it changes.".dim()),
         Line::from(""),
-        Line::from(vec![
-            Span::from(format!("{}-", prompt.prefix)).fg(Color::DarkGray),
-            Span::from(format!("{}▏", prompt.slug)),
-        ]),
+        input_spans(
+            vec![Span::from(format!("{}-", prompt.prefix)).fg(Color::DarkGray)],
+            &prompt.slug,
+        ),
     ];
     let modal = Paragraph::new(lines)
         .block(
@@ -255,13 +263,13 @@ fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
                 .highlight_symbol("› ");
             f.render_stateful_widget(list, area, &mut state);
         }
-        PromptPickerView::Custom { text } => {
+        PromptPickerView::Custom { input } => {
             let area = centered_rect(60, 6, f.area());
             f.render_widget(Clear, area);
             let lines = vec![
                 Line::from("Custom prompt (Enter to send · Esc to cancel):".dim()),
                 Line::from(""),
-                Line::from(format!("{text}▏")),
+                input_spans(vec![], input),
             ];
             let modal = Paragraph::new(lines)
                 .block(
@@ -278,6 +286,31 @@ fn render_prompt_modal(f: &mut Frame, view: &PromptPickerView) {
             f.render_widget(modal, area);
         }
     }
+}
+
+/// Build the spans for an editable field: an optional prefix, the text, and a
+/// block cursor drawn (reverse-video) at the input's cursor position.
+fn input_spans(prefix: Vec<Span<'static>>, input: &InputView) -> Line<'static> {
+    let chars: Vec<char> = input.text.chars().collect();
+    let cursor = input.cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let (at, after): (String, String) = if cursor < chars.len() {
+        (
+            chars[cursor].to_string(),
+            chars[cursor + 1..].iter().collect(),
+        )
+    } else {
+        // Cursor past the end: draw it on a trailing space.
+        (" ".to_string(), String::new())
+    };
+    let mut spans = prefix;
+    spans.push(Span::from(before));
+    spans.push(Span::styled(
+        at,
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    spans.push(Span::from(after));
+    Line::from(spans)
 }
 
 /// A `Rect` of the given size, centered within `area`.
@@ -348,8 +381,15 @@ fn pane_block(title: String, focused: bool, accent: Color) -> Block<'static> {
 fn render_notes_list(f: &mut Frame, app: &mut App, area: Rect, accent: Color) {
     let focused = app.focus == Focus::Notes;
     let files = app.visible_files();
-    let title = if app.searching || !app.query.is_empty() {
-        format!(" 1 Search: {}▏ ", app.query)
+    let title = if app.searching || !app.query_is_empty() {
+        // The block title can't host styled spans, so render the cursor as a
+        // caret inserted at its character offset.
+        let view = app.query_view();
+        let chars: Vec<char> = view.text.chars().collect();
+        let cursor = view.cursor.min(chars.len());
+        let before: String = chars[..cursor].iter().collect();
+        let after: String = chars[cursor..].iter().collect();
+        format!(" 1 Search: {before}▏{after} ")
     } else {
         format!(" 1 Files ({}) ", files.len())
     };
@@ -473,10 +513,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect, accent: Color) {
         Focus::Related => "j/k: select   Enter: jump",
         Focus::Scratchpad => "j/k: select   x: remove",
     };
-    let text = if !app.query.is_empty() {
+    let text = if !app.query_is_empty() {
         format!(
             "filtered: \"{}\"   Esc: clear   {move_hint}   /: search   q: quit",
-            app.query
+            app.query_text()
         )
     } else {
         format!("1-4/Tab: panes   {move_hint}   a: +scratchpad   e: edit   r: rename   c: config   y: copy   /: search   q: quit")

@@ -12,6 +12,7 @@ use crate::llm::{self, Effort, ProviderKind, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::rename;
 use crate::ui::markdown;
+use crate::ui::textinput::{InputView, TextInput};
 
 /// Which pane currently receives navigation keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,8 +88,8 @@ pub enum Action {
 struct PromptPicker {
     /// 0..PROMPTS.len() selects a preset; the last row selects "Custom…".
     selected: usize,
-    /// `Some(text)` when in the custom free-text input mode.
-    custom: Option<String>,
+    /// `Some(input)` when in the custom free-text input mode.
+    custom: Option<TextInput>,
 }
 
 /// Read-only view of the prompt picker, for rendering the modal.
@@ -98,7 +99,7 @@ pub enum PromptPickerView {
         selected: usize,
     },
     Custom {
-        text: String,
+        input: InputView,
     },
 }
 
@@ -132,8 +133,8 @@ const CONFIG_ROW_PROMPTS: usize = 3;
 struct ConfigModal {
     /// Highlighted row (0 provider, 1 model, 2 prompts).
     selected: usize,
-    /// `Some(buffer)` while the model field is being edited.
-    editing_model: Option<String>,
+    /// `Some(input)` while the model field is being edited.
+    editing_model: Option<TextInput>,
 }
 
 /// Which field of a prompt is being edited in the prompt-admin editor.
@@ -148,8 +149,8 @@ struct PromptEdit {
     /// `Some(id)` when editing an existing prompt; `None` when adding.
     id: Option<i64>,
     field: PromptField,
-    label: String,
-    text: String,
+    label: TextInput,
+    text: TextInput,
 }
 
 /// State of the open prompt-library manager (reached from the config modal).
@@ -170,8 +171,8 @@ pub enum PromptAdminView {
     /// Editing/adding a prompt.
     Edit {
         adding: bool,
-        label: String,
-        text: String,
+        label: InputView,
+        text: InputView,
         /// Whether the label field (true) or text field (false) is active.
         editing_label: bool,
     },
@@ -180,8 +181,10 @@ pub enum PromptAdminView {
 /// Read-only snapshot of the config modal, for rendering.
 pub struct ConfigView {
     pub provider_label: &'static str,
-    /// The model for the selected provider (the edit buffer while editing).
+    /// The model for the selected provider when not editing.
     pub model: String,
+    /// `Some` (with a cursor) while the model field is being edited.
+    pub model_input: Option<InputView>,
     pub editing_model: bool,
     /// The reasoning-effort label for the active provider, or `None` when the
     /// active provider (Ollama) has no effort control.
@@ -195,15 +198,15 @@ pub struct ConfigView {
 struct RenameState {
     path: PathBuf,
     prefix: String,
-    slug: String,
+    slug: TextInput,
 }
 
 /// Read-only snapshot of the rename modal, for rendering.
 pub struct RenamePrompt {
     /// The fixed `YYYYMMDDHHMM` prefix, shown before the editable slug.
     pub prefix: String,
-    /// The current editable slug text.
-    pub slug: String,
+    /// The current editable slug (with cursor).
+    pub slug: InputView,
 }
 
 /// Read-only snapshot of the current link prompt, for rendering the modal.
@@ -247,7 +250,7 @@ pub struct App {
     /// Whether the search input is capturing keystrokes.
     pub searching: bool,
     /// Current search query (also used as a persistent filter).
-    pub query: String,
+    query: TextInput,
     /// Selection state for the notes list widget.
     pub list_state: ListState,
     /// Selection state for the related-notes list widget.
@@ -303,7 +306,7 @@ impl App {
             preview_scroll: 0,
             related_selected: 0,
             searching: false,
-            query: String::new(),
+            query: TextInput::new(),
             list_state: ListState::default(),
             related_state: ListState::default(),
             scratchpad,
@@ -495,17 +498,12 @@ impl App {
                 // First Esc leaves the input but keeps the filter; a second Esc
                 // (handled below, in normal mode) clears it.
                 KeyCode::Esc | KeyCode::Enter => self.searching = false,
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.refilter();
-                    self.select_note_changed();
+                _ => {
+                    if self.query.handle(key) {
+                        self.refilter();
+                        self.select_note_changed();
+                    }
                 }
-                KeyCode::Char(c) => {
-                    self.query.push(c);
-                    self.refilter();
-                    self.select_note_changed();
-                }
-                _ => {}
             }
             return Action::None;
         }
@@ -516,7 +514,7 @@ impl App {
             // the search input).
             KeyCode::Esc => {
                 if !self.query.is_empty() {
-                    self.query.clear();
+                    self.query = TextInput::new();
                     self.refilter();
                     self.select_note_changed();
                 }
@@ -738,7 +736,7 @@ impl App {
     pub fn rename_prompt(&self) -> Option<RenamePrompt> {
         self.renaming.as_ref().map(|state| RenamePrompt {
             prefix: state.prefix.clone(),
-            slug: state.slug.clone(),
+            slug: state.slug.view(),
         })
     }
 
@@ -761,7 +759,7 @@ impl App {
         self.renaming = Some(RenameState {
             path: PathBuf::from(path),
             prefix,
-            slug,
+            slug: TextInput::with_text(&slug),
         });
     }
 
@@ -769,21 +767,11 @@ impl App {
     fn handle_rename_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => self.renaming = None,
-            KeyCode::Backspace => {
-                if let Some(state) = self.renaming.as_mut() {
-                    state.slug.pop();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(state) = self.renaming.as_mut() {
-                    state.slug.push(c);
-                }
-            }
             KeyCode::Enter => {
                 let Some(state) = self.renaming.take() else {
                     return Action::None;
                 };
-                let new_slug = state.slug.trim().to_string();
+                let new_slug = state.slug.text().trim().to_string();
                 if new_slug.is_empty() {
                     self.set_status("Rename cancelled — name was empty.");
                     return Action::None;
@@ -793,7 +781,11 @@ impl App {
                     new_slug,
                 };
             }
-            _ => {}
+            _ => {
+                if let Some(state) = self.renaming.as_mut() {
+                    state.slug.handle(key);
+                }
+            }
         }
         Action::None
     }
@@ -851,15 +843,28 @@ impl App {
         let provider = ProviderKind::ALL[self.llm_provider_idx];
         self.config_modal.as_ref().map(|m| ConfigView {
             provider_label: provider.label(),
-            model: m
-                .editing_model
-                .clone()
-                .unwrap_or_else(|| self.llm_models[self.llm_provider_idx].clone()),
+            model: self.llm_models[self.llm_provider_idx].clone(),
+            model_input: m.editing_model.as_ref().map(|t| t.view()),
             editing_model: m.editing_model.is_some(),
             effort: provider.supports_effort().then(|| self.llm_effort.label()),
             selected: m.selected,
             prompt_count: self.prompts.len(),
         })
+    }
+
+    /// Whether the search filter is non-empty.
+    pub fn query_is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// The current search text.
+    pub fn query_text(&self) -> String {
+        self.query.text()
+    }
+
+    /// A render snapshot of the search input (text + cursor).
+    pub fn query_view(&self) -> InputView {
+        self.query.view()
     }
 
     /// Install the prompt library loaded from the DB.
@@ -883,11 +888,11 @@ impl App {
     /// Handle a key while the config modal is open.
     fn handle_config_key(&mut self, key: KeyEvent) -> Action {
         // Editing the model text field captures all input.
-        if let Some(buf) = self
+        let editing = self
             .config_modal
             .as_ref()
-            .and_then(|m| m.editing_model.clone())
-        {
+            .is_some_and(|m| m.editing_model.is_some());
+        if editing {
             match key.code {
                 KeyCode::Esc => {
                     if let Some(m) = self.config_modal.as_mut() {
@@ -895,7 +900,12 @@ impl App {
                     }
                 }
                 KeyCode::Enter => {
-                    let model = buf.trim().to_string();
+                    let model = self
+                        .config_modal
+                        .as_ref()
+                        .and_then(|m| m.editing_model.as_ref())
+                        .map(|t| t.text().trim().to_string())
+                        .unwrap_or_default();
                     if let Some(m) = self.config_modal.as_mut() {
                         m.editing_model = None;
                     }
@@ -904,21 +914,15 @@ impl App {
                         return Action::LlmConfigChanged;
                     }
                 }
-                KeyCode::Backspace => {
-                    if let Some(m) = self.config_modal.as_mut() {
-                        if let Some(b) = m.editing_model.as_mut() {
-                            b.pop();
-                        }
+                _ => {
+                    if let Some(input) = self
+                        .config_modal
+                        .as_mut()
+                        .and_then(|m| m.editing_model.as_mut())
+                    {
+                        input.handle(key);
                     }
                 }
-                KeyCode::Char(c) => {
-                    if let Some(m) = self.config_modal.as_mut() {
-                        if let Some(b) = m.editing_model.as_mut() {
-                            b.push(c);
-                        }
-                    }
-                }
-                _ => {}
             }
             return Action::None;
         }
@@ -970,7 +974,7 @@ impl App {
                     Some(CONFIG_ROW_MODEL) => {
                         let current = self.llm_models[self.llm_provider_idx].clone();
                         if let Some(m) = self.config_modal.as_mut() {
-                            m.editing_model = Some(current);
+                            m.editing_model = Some(TextInput::with_text(&current));
                         }
                     }
                     Some(CONFIG_ROW_PROMPTS) => {
@@ -995,7 +999,9 @@ impl App {
         self.prompt_picker
             .as_ref()
             .map(|picker| match &picker.custom {
-                Some(text) => PromptPickerView::Custom { text: text.clone() },
+                Some(input) => PromptPickerView::Custom {
+                    input: input.view(),
+                },
                 None => {
                     let mut labels: Vec<String> =
                         self.prompts.iter().map(|p| p.label.clone()).collect();
@@ -1038,24 +1044,18 @@ impl App {
                     let text = self
                         .prompt_picker
                         .as_ref()
-                        .and_then(|p| p.custom.clone())
+                        .and_then(|p| p.custom.as_ref())
+                        .map(|t| t.text().trim().to_string())
                         .unwrap_or_default();
-                    let text = text.trim().to_string();
                     if !text.is_empty() {
                         return self.confirm_synthesis(&text);
                     }
                 }
-                KeyCode::Backspace => {
+                _ => {
                     if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
-                        t.pop();
+                        t.handle(key);
                     }
                 }
-                KeyCode::Char(c) => {
-                    if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
-                        t.push(c);
-                    }
-                }
-                _ => {}
             }
             return Action::None;
         }
@@ -1077,7 +1077,7 @@ impl App {
                 let selected = self.prompt_picker.as_ref().map(|p| p.selected).unwrap_or(0);
                 if selected >= count {
                     if let Some(p) = self.prompt_picker.as_mut() {
-                        p.custom = Some(String::new());
+                        p.custom = Some(TextInput::new());
                     }
                 } else {
                     let text = self.prompts[selected].text.clone();
@@ -1126,8 +1126,8 @@ impl App {
             .map(|admin| match &admin.editing {
                 Some(edit) => PromptAdminView::Edit {
                     adding: edit.id.is_none(),
-                    label: edit.label.clone(),
-                    text: edit.text.clone(),
+                    label: edit.label.view(),
+                    text: edit.text.view(),
                     editing_label: edit.field == PromptField::Label,
                 },
                 None => PromptAdminView::List {
@@ -1170,8 +1170,8 @@ impl App {
                     a.editing = Some(PromptEdit {
                         id: None,
                         field: PromptField::Label,
-                        label: String::new(),
-                        text: String::new(),
+                        label: TextInput::new(),
+                        text: TextInput::new(),
                     });
                 }
             }
@@ -1182,8 +1182,8 @@ impl App {
                         a.editing = Some(PromptEdit {
                             id: Some(prompt.id),
                             field: PromptField::Label,
-                            label: prompt.label,
-                            text: prompt.text,
+                            label: TextInput::with_text(&prompt.label),
+                            text: TextInput::with_text(&prompt.text),
                         });
                     }
                 }
@@ -1243,8 +1243,8 @@ impl App {
             KeyCode::Enter => {
                 // Save. Both fields must be non-empty.
                 if let Some(edit) = self.prompt_admin.as_ref().and_then(|a| a.editing.as_ref()) {
-                    let label = edit.label.trim().to_string();
-                    let text = edit.text.trim().to_string();
+                    let label = edit.label.text().trim().to_string();
+                    let text = edit.text.text().trim().to_string();
                     let id = edit.id;
                     if label.is_empty() || text.is_empty() {
                         self.set_status("A prompt needs both a label and text.");
@@ -1259,23 +1259,14 @@ impl App {
                     };
                 }
             }
-            KeyCode::Backspace => {
+            _ => {
                 if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
                     match edit.field {
-                        PromptField::Label => edit.label.pop(),
-                        PromptField::Text => edit.text.pop(),
+                        PromptField::Label => edit.label.handle(key),
+                        PromptField::Text => edit.text.handle(key),
                     };
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
-                    match edit.field {
-                        PromptField::Label => edit.label.push(c),
-                        PromptField::Text => edit.text.push(c),
-                    }
-                }
-            }
-            _ => {}
         }
         Action::None
     }
@@ -1394,7 +1385,7 @@ impl App {
         }
         // If the target is filtered out, clear the search so it is reachable.
         if !self.filtered.iter().any(|&i| self.notes[i].path == path) {
-            self.query.clear();
+            self.query = TextInput::new();
             self.searching = false;
             self.refilter();
         }
@@ -1411,7 +1402,7 @@ impl App {
     }
 
     fn refilter(&mut self) {
-        let query = self.query.to_lowercase();
+        let query = self.query.text().to_lowercase();
         self.filtered = self
             .notes
             .iter()
