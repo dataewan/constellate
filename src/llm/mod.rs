@@ -49,6 +49,14 @@ pub const PROMPTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// A stored synthesis prompt from the DB-backed prompt library.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    pub id: i64,
+    pub label: String,
+    pub text: String,
+}
+
 /// Which LLM backend to use for synthesis. Persisted in the `meta` table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {

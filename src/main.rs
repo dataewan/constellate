@@ -122,6 +122,11 @@ fn main() -> Result<()> {
     let (provider, llm_models, llm_effort) = resolve_llm_config(&store, &config)?;
     app.set_llm_config(provider, llm_models, llm_effort);
 
+    // Seed the prompt library from the built-in presets on first run, then load
+    // it (user edits persist across sessions).
+    store.seed_prompts()?;
+    app.set_prompts(store.load_prompts()?);
+
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app, &mut store, &config);
     restore_terminal(&mut terminal)?;
@@ -309,6 +314,22 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                         store.set_llm_model(*kind, model)?;
                     }
                     store.set_llm_effort(effort)?;
+                }
+                Action::PromptAdd { label, text } => {
+                    store.add_prompt(&label, &text)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptUpdate { id, label, text } => {
+                    store.update_prompt(id, &label, &text)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptDelete { id } => {
+                    store.delete_prompt(id)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptReorder { id_a, id_b } => {
+                    store.swap_prompt_positions(id_a, id_b)?;
+                    app.set_prompts(store.load_prompts()?);
                 }
                 Action::RenameNote { path, new_slug } => {
                     let notes = store.all_notes()?;

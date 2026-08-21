@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::llm::{Effort, ProviderKind};
+use crate::llm::{Effort, Prompt, ProviderKind};
 use crate::vault::ParsedNote;
 
 /// A note loaded for browsing, searching, preview, and relatedness.
@@ -92,8 +92,108 @@ impl Store {
                 note_path TEXT PRIMARY KEY,
                 position  INTEGER NOT NULL
             );
+
+            -- The synthesis prompt library, ordered by `position`. Seeded once
+            -- from `llm::PROMPTS` (see `seed_prompts`), then user-editable.
+            CREATE TABLE IF NOT EXISTS llm_prompts (
+                id       INTEGER PRIMARY KEY,
+                label    TEXT NOT NULL,
+                prompt   TEXT NOT NULL,
+                position INTEGER NOT NULL
+            );
             "#,
         )?;
+        Ok(())
+    }
+
+    /// Seed the prompt library from the built-in presets on first run. Guarded
+    /// by a `meta` flag so it happens exactly once — deleting every prompt does
+    /// not trigger a re-seed.
+    pub fn seed_prompts(&mut self) -> Result<()> {
+        if self.meta_get("prompts_seeded")?.is_some() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for (i, (label, prompt)) in crate::llm::PROMPTS.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO llm_prompts (label, prompt, position) VALUES (?1, ?2, ?3)",
+                params![label, prompt, i as i64],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('prompts_seeded', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The prompt library, ordered by position.
+    pub fn load_prompts(&self) -> Result<Vec<Prompt>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, prompt FROM llm_prompts ORDER BY position, id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Prompt {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Append a new prompt at the end of the library. Returns its new id.
+    pub fn add_prompt(&self, label: &str, prompt: &str) -> Result<i64> {
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM llm_prompts",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO llm_prompts (label, prompt, position) VALUES (?1, ?2, ?3)",
+            params![label, prompt, next_pos],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Update an existing prompt's label and text.
+    pub fn update_prompt(&self, id: i64, label: &str, prompt: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE llm_prompts SET label = ?1, prompt = ?2 WHERE id = ?3",
+            params![label, prompt, id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a prompt by id.
+    pub fn delete_prompt(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM llm_prompts WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Swap the positions of two prompts (used to reorder the library).
+    pub fn swap_prompt_positions(&mut self, id_a: i64, id_b: i64) -> Result<()> {
+        let pos = |id: i64| -> Result<i64> {
+            Ok(self.conn.query_row(
+                "SELECT position FROM llm_prompts WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?)
+        };
+        let (pa, pb) = (pos(id_a)?, pos(id_b)?);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE llm_prompts SET position = ?1 WHERE id = ?2",
+            params![pb, id_a],
+        )?;
+        tx.execute(
+            "UPDATE llm_prompts SET position = ?1 WHERE id = ?2",
+            params![pa, id_b],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -439,6 +539,60 @@ mod tests {
         assert_eq!(store.llm_effort().unwrap(), None);
         store.set_llm_effort(Effort::High).unwrap();
         assert_eq!(store.llm_effort().unwrap(), Some(Effort::High));
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn prompt_library_crud_and_seed() {
+        let db = temp_db();
+        let mut store = Store::open(&db).unwrap();
+
+        // Empty until seeded, then seeded exactly once (idempotent).
+        assert!(store.load_prompts().unwrap().is_empty());
+        store.seed_prompts().unwrap();
+        let seeded = store.load_prompts().unwrap();
+        assert_eq!(seeded.len(), crate::llm::PROMPTS.len());
+        assert_eq!(seeded[0].label, crate::llm::PROMPTS[0].0);
+        store.seed_prompts().unwrap();
+        assert_eq!(store.load_prompts().unwrap().len(), seeded.len());
+
+        // Add appends at the end.
+        let id = store.add_prompt("Custom", "Do a thing").unwrap();
+        let prompts = store.load_prompts().unwrap();
+        assert_eq!(prompts.last().unwrap().id, id);
+        assert_eq!(prompts.last().unwrap().text, "Do a thing");
+
+        // Update in place.
+        store.update_prompt(id, "Renamed", "Do it well").unwrap();
+        let updated = store
+            .load_prompts()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap();
+        assert_eq!(updated.label, "Renamed");
+        assert_eq!(updated.text, "Do it well");
+
+        // Reorder: swap the first two.
+        let before = store.load_prompts().unwrap();
+        store
+            .swap_prompt_positions(before[0].id, before[1].id)
+            .unwrap();
+        let after = store.load_prompts().unwrap();
+        assert_eq!(after[0].id, before[1].id);
+        assert_eq!(after[1].id, before[0].id);
+
+        // Delete.
+        store.delete_prompt(id).unwrap();
+        assert!(store.load_prompts().unwrap().iter().all(|p| p.id != id));
+
+        // Seeding never runs again even if the library is emptied.
+        for p in store.load_prompts().unwrap() {
+            store.delete_prompt(p.id).unwrap();
+        }
+        store.seed_prompts().unwrap();
+        assert!(store.load_prompts().unwrap().is_empty());
 
         let _ = std::fs::remove_file(&db);
     }

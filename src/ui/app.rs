@@ -61,6 +61,26 @@ pub enum Action {
     },
     /// The LLM provider/model config changed and should be persisted.
     LlmConfigChanged,
+    /// Add a new prompt to the library.
+    PromptAdd {
+        label: String,
+        text: String,
+    },
+    /// Update an existing prompt.
+    PromptUpdate {
+        id: i64,
+        label: String,
+        text: String,
+    },
+    /// Delete a prompt from the library.
+    PromptDelete {
+        id: i64,
+    },
+    /// Swap two prompts' positions (reorder).
+    PromptReorder {
+        id_a: i64,
+        id_b: i64,
+    },
 }
 
 /// The scratchpad → LLM prompt picker: choose a preset or enter a custom prompt.
@@ -114,6 +134,47 @@ struct ConfigModal {
     selected: usize,
     /// `Some(buffer)` while the model field is being edited.
     editing_model: Option<String>,
+}
+
+/// Which field of a prompt is being edited in the prompt-admin editor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptField {
+    Label,
+    Text,
+}
+
+/// An in-progress add/edit of a single prompt.
+struct PromptEdit {
+    /// `Some(id)` when editing an existing prompt; `None` when adding.
+    id: Option<i64>,
+    field: PromptField,
+    label: String,
+    text: String,
+}
+
+/// State of the open prompt-library manager (reached from the config modal).
+struct PromptAdmin {
+    /// Highlighted row in the prompt list.
+    selected: usize,
+    /// `Some` while adding or editing a prompt.
+    editing: Option<PromptEdit>,
+}
+
+/// Read-only snapshot of the prompt manager, for rendering.
+pub enum PromptAdminView {
+    /// Browsing the list: `(label, is_selected)` per row.
+    List {
+        prompts: Vec<String>,
+        selected: usize,
+    },
+    /// Editing/adding a prompt.
+    Edit {
+        adding: bool,
+        label: String,
+        text: String,
+        /// Whether the label field (true) or text field (false) is active.
+        editing_label: bool,
+    },
 }
 
 /// Read-only snapshot of the config modal, for rendering.
@@ -205,6 +266,10 @@ pub struct App {
     renaming: Option<RenameState>,
     /// Open LLM config modal, if any.
     config_modal: Option<ConfigModal>,
+    /// Open prompt-library manager, if any.
+    prompt_admin: Option<PromptAdmin>,
+    /// The synthesis prompt library, loaded from the DB.
+    prompts: Vec<llm::Prompt>,
     /// Index into `ProviderKind::ALL` of the active provider.
     llm_provider_idx: usize,
     /// The model for each provider, in `ProviderKind::ALL` order.
@@ -248,6 +313,8 @@ impl App {
             prompt_picker: None,
             renaming: None,
             config_modal: None,
+            prompt_admin: None,
+            prompts: Vec::new(),
             llm_provider_idx: 0,
             llm_models: [
                 ProviderKind::ALL[0].default_model().to_string(),
@@ -415,6 +482,9 @@ impl App {
         }
         if self.renaming.is_some() {
             return self.handle_rename_key(key);
+        }
+        if self.prompt_admin.is_some() {
+            return self.handle_prompt_admin_key(key);
         }
         if self.config_modal.is_some() {
             return self.handle_config_key(key);
@@ -788,8 +858,18 @@ impl App {
             editing_model: m.editing_model.is_some(),
             effort: provider.supports_effort().then(|| self.llm_effort.label()),
             selected: m.selected,
-            prompt_count: llm::PROMPTS.len(),
+            prompt_count: self.prompts.len(),
         })
+    }
+
+    /// Install the prompt library loaded from the DB.
+    pub fn set_prompts(&mut self, prompts: Vec<llm::Prompt>) {
+        self.prompts = prompts;
+        if let Some(admin) = self.prompt_admin.as_mut() {
+            if admin.editing.is_none() {
+                admin.selected = admin.selected.min(self.prompts.len().saturating_sub(1));
+            }
+        }
     }
 
     /// Open the LLM config modal.
@@ -894,7 +974,13 @@ impl App {
                         }
                     }
                     Some(CONFIG_ROW_PROMPTS) => {
-                        self.set_status("Editing prompts comes in a later update.");
+                        // Hand off to the prompt-library manager, closing the
+                        // config modal so only one overlay is active.
+                        self.config_modal = None;
+                        self.prompt_admin = Some(PromptAdmin {
+                            selected: 0,
+                            editing: None,
+                        });
                     }
                     _ => {}
                 }
@@ -912,7 +998,7 @@ impl App {
                 Some(text) => PromptPickerView::Custom { text: text.clone() },
                 None => {
                     let mut labels: Vec<String> =
-                        llm::PROMPTS.iter().map(|(l, _)| (*l).to_string()).collect();
+                        self.prompts.iter().map(|p| p.label.clone()).collect();
                     labels.push("Custom…".to_string());
                     PromptPickerView::List {
                         labels,
@@ -974,7 +1060,7 @@ impl App {
             return Action::None;
         }
 
-        let count = llm::PROMPTS.len();
+        let count = self.prompts.len();
         match key.code {
             KeyCode::Esc => self.prompt_picker = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -994,15 +1080,15 @@ impl App {
                         p.custom = Some(String::new());
                     }
                 } else {
-                    let (_label, text) = llm::PROMPTS[selected];
-                    return self.confirm_synthesis(text);
+                    let text = self.prompts[selected].text.clone();
+                    return self.confirm_synthesis(&text);
                 }
             }
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = c as usize - '1' as usize;
                 if idx < count {
-                    let (_label, text) = llm::PROMPTS[idx];
-                    return self.confirm_synthesis(text);
+                    let text = self.prompts[idx].text.clone();
+                    return self.confirm_synthesis(&text);
                 }
             }
             _ => {}
@@ -1031,6 +1117,167 @@ impl App {
             prompt_text: prompt_text.to_string(),
             sources,
         })
+    }
+
+    /// A read-only snapshot of the prompt manager, for rendering.
+    pub fn prompt_admin_view(&self) -> Option<PromptAdminView> {
+        self.prompt_admin
+            .as_ref()
+            .map(|admin| match &admin.editing {
+                Some(edit) => PromptAdminView::Edit {
+                    adding: edit.id.is_none(),
+                    label: edit.label.clone(),
+                    text: edit.text.clone(),
+                    editing_label: edit.field == PromptField::Label,
+                },
+                None => PromptAdminView::List {
+                    prompts: self.prompts.iter().map(|p| p.label.clone()).collect(),
+                    selected: admin.selected,
+                },
+            })
+    }
+
+    /// Handle a key while the prompt-library manager is open.
+    fn handle_prompt_admin_key(&mut self, key: KeyEvent) -> Action {
+        // Editing/adding a prompt captures all input.
+        if self
+            .prompt_admin
+            .as_ref()
+            .is_some_and(|a| a.editing.is_some())
+        {
+            return self.handle_prompt_edit_key(key);
+        }
+
+        let count = self.prompts.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.prompt_admin = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    if count > 0 {
+                        a.selected = (a.selected + count - 1) % count;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    if count > 0 {
+                        a.selected = (a.selected + 1) % count;
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    a.editing = Some(PromptEdit {
+                        id: None,
+                        field: PromptField::Label,
+                        label: String::new(),
+                        text: String::new(),
+                    });
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if let Some(prompt) = self.prompts.get(sel).cloned() {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.editing = Some(PromptEdit {
+                            id: Some(prompt.id),
+                            field: PromptField::Label,
+                            label: prompt.label,
+                            text: prompt.text,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if let Some(prompt) = self.prompts.get(sel) {
+                    return Action::PromptDelete { id: prompt.id };
+                }
+            }
+            // Shift+J / Shift+K reorder the selected prompt down / up.
+            KeyCode::Char('J') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if sel + 1 < count {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.selected = sel + 1;
+                    }
+                    return Action::PromptReorder {
+                        id_a: self.prompts[sel].id,
+                        id_b: self.prompts[sel + 1].id,
+                    };
+                }
+            }
+            KeyCode::Char('K') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if sel > 0 && sel < count {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.selected = sel - 1;
+                    }
+                    return Action::PromptReorder {
+                        id_a: self.prompts[sel].id,
+                        id_b: self.prompts[sel - 1].id,
+                    };
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Handle a key while adding/editing a single prompt.
+    fn handle_prompt_edit_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    a.editing = None;
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
+                    edit.field = match edit.field {
+                        PromptField::Label => PromptField::Text,
+                        PromptField::Text => PromptField::Label,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                // Save. Both fields must be non-empty.
+                if let Some(edit) = self.prompt_admin.as_ref().and_then(|a| a.editing.as_ref()) {
+                    let label = edit.label.trim().to_string();
+                    let text = edit.text.trim().to_string();
+                    let id = edit.id;
+                    if label.is_empty() || text.is_empty() {
+                        self.set_status("A prompt needs both a label and text.");
+                        return Action::None;
+                    }
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.editing = None;
+                    }
+                    return match id {
+                        Some(id) => Action::PromptUpdate { id, label, text },
+                        None => Action::PromptAdd { label, text },
+                    };
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
+                    match edit.field {
+                        PromptField::Label => edit.label.pop(),
+                        PromptField::Text => edit.text.pop(),
+                    };
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
+                    match edit.field {
+                        PromptField::Label => edit.label.push(c),
+                        PromptField::Text => edit.text.push(c),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     /// Enter does something different depending on the focused pane.

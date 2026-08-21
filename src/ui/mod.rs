@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub use app::{ConfigView, LinkPrompt, PromptPickerView, RenamePrompt};
+pub use app::{ConfigView, LinkPrompt, PromptAdminView, PromptPickerView, RenamePrompt};
 
 /// Render the full three-pane layout plus a footer.
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -54,6 +54,90 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(view) = app.config_view() {
         render_config_modal(f, &view);
     }
+    if let Some(view) = app.prompt_admin_view() {
+        render_prompt_admin(f, &view);
+    }
+}
+
+fn render_prompt_admin(f: &mut Frame, view: &PromptAdminView) {
+    let area = centered_rect(70, 18, f.area());
+    f.render_widget(Clear, area);
+
+    let (lines, hint): (Vec<Line>, &str) = match view {
+        PromptAdminView::List { prompts, selected } => {
+            let mut lines: Vec<Line> = Vec::new();
+            if prompts.is_empty() {
+                lines.push(Line::from("(no prompts — press 'a' to add one)".dim()));
+            }
+            for (i, label) in prompts.iter().enumerate() {
+                let marker = if i == *selected { "› " } else { "  " };
+                let style = if i == *selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+            }
+            (
+                lines,
+                "↑/↓ move · a add · e edit · d delete · J/K reorder · Esc close",
+            )
+        }
+        PromptAdminView::Edit {
+            adding,
+            label,
+            text,
+            editing_label,
+        } => {
+            let label_line = if *editing_label {
+                Line::from(vec![
+                    Span::from("Label  ").fg(Color::Cyan),
+                    Span::from(format!("{label}▏")),
+                ])
+            } else {
+                Line::from(vec![Span::from("Label  ").dim(), Span::from(label.clone())])
+            };
+            let text_line = if *editing_label {
+                Line::from(vec![Span::from("Prompt ").dim(), Span::from(text.clone())])
+            } else {
+                Line::from(vec![
+                    Span::from("Prompt ").fg(Color::Cyan),
+                    Span::from(format!("{text}▏")),
+                ])
+            };
+            let heading = if *adding { "Add prompt" } else { "Edit prompt" };
+            (
+                vec![
+                    Line::from(heading.bold()),
+                    Line::from(""),
+                    label_line,
+                    Line::from(""),
+                    text_line,
+                ],
+                "Tab switch field · Enter save · Esc cancel",
+            )
+        }
+    };
+
+    let mut all = lines;
+    all.push(Line::from(""));
+    all.push(Line::from(hint.dim()));
+
+    let modal = Paragraph::new(all)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Prompt library ")
+                .border_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(modal, area);
 }
 
 fn render_config_modal(f: &mut Frame, view: &ConfigView) {
