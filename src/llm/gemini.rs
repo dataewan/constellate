@@ -8,7 +8,7 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-use super::LlmProvider;
+use super::{Effort, LlmProvider};
 
 const BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -16,11 +16,16 @@ const BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 pub struct GeminiProvider {
     api_key: String,
     model: String,
+    effort: Effort,
 }
 
 impl GeminiProvider {
-    pub fn new(api_key: String, model: String) -> Self {
-        GeminiProvider { api_key, model }
+    pub fn new(api_key: String, model: String, effort: Effort) -> Self {
+        GeminiProvider {
+            api_key,
+            model,
+            effort,
+        }
     }
 }
 
@@ -62,6 +67,9 @@ impl LlmProvider for GeminiProvider {
             .header("x-goog-api-key", &self.api_key)
             .json(&serde_json::json!({
                 "contents": [{ "parts": [{ "text": prompt }] }],
+                "generationConfig": {
+                    "thinkingConfig": { "thinkingBudget": self.effort.gemini_budget() },
+                },
             }))
             .send()
             .map_err(|e| format!("requesting Gemini: {e}"))?;

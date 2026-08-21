@@ -57,7 +57,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_config_modal(f: &mut Frame, view: &ConfigView) {
-    let area = centered_rect(60, 10, f.area());
+    let area = centered_rect(60, 11, f.area());
     f.render_widget(Clear, area);
 
     // One line per row; the selected row is marked and the model row shows a
@@ -68,6 +68,10 @@ fn render_config_modal(f: &mut Frame, view: &ConfigView) {
             format!("Model      {}▏", view.model)
         } else {
             format!("Model      {}", view.model)
+        },
+        match view.effort {
+            Some(label) => format!("Effort     {label}"),
+            None => "Effort     — (not supported)".to_string(),
         },
         format!("Prompts    {} preset(s)", view.prompt_count),
     ];
@@ -87,7 +91,7 @@ fn render_config_modal(f: &mut Frame, view: &ConfigView) {
     let hint = if view.editing_model {
         "Type a model name · Enter save · Esc cancel"
     } else {
-        "↑/↓ move · ←/→ change provider · Enter edit · Esc close"
+        "↑/↓ move · ←/→ change provider/effort · Enter edit · Esc close"
     };
     lines.push(Line::from(hint.dim()));
 

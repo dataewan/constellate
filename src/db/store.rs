@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::llm::ProviderKind;
+use crate::llm::{Effort, ProviderKind};
 use crate::vault::ParsedNote;
 
 /// A note loaded for browsing, searching, preview, and relatedness.
@@ -159,6 +159,17 @@ impl Store {
     /// Persist the model for a given provider.
     pub fn set_llm_model(&self, kind: ProviderKind, model: &str) -> Result<()> {
         self.meta_set(&format!("llm_model_{}", kind.as_str()), model)
+    }
+
+    /// The persisted reasoning-effort level, if set. Applies to whichever
+    /// hosted provider is active; ignored by Ollama.
+    pub fn llm_effort(&self) -> Result<Option<Effort>> {
+        Ok(self.meta_get("llm_effort")?.and_then(|s| Effort::parse(&s)))
+    }
+
+    /// Persist the reasoning-effort level.
+    pub fn set_llm_effort(&self, effort: Effort) -> Result<()> {
+        self.meta_set("llm_effort", effort.as_str())
     }
 
     /// Ensure stored embeddings match the active backend/model. If the model
@@ -423,6 +434,11 @@ mod tests {
             Some("llama3")
         );
         assert_eq!(store.llm_model(ProviderKind::Gemini).unwrap(), None);
+
+        // Effort is unset by default, then round-trips.
+        assert_eq!(store.llm_effort().unwrap(), None);
+        store.set_llm_effort(Effort::High).unwrap();
+        assert_eq!(store.llm_effort().unwrap(), Some(Effort::High));
 
         let _ = std::fs::remove_file(&db);
     }

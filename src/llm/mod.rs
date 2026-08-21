@@ -107,12 +107,83 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this backend has a reasoning-effort control we can drive.
+    /// Ollama has no equivalent, so the effort setting is inert for it.
+    pub fn supports_effort(self) -> bool {
+        match self {
+            ProviderKind::Ollama => false,
+            ProviderKind::Claude | ProviderKind::Gemini => true,
+        }
+    }
+
     /// All backends, in modal display order.
     pub const ALL: [ProviderKind; 3] = [
         ProviderKind::Ollama,
         ProviderKind::Claude,
         ProviderKind::Gemini,
     ];
+}
+
+/// A provider-agnostic reasoning-effort level. Each backend that supports it
+/// maps these to its own mechanism (Claude `output_config.effort`, Gemini
+/// `thinkingConfig.thinkingBudget`); Ollama ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// The stable string used in the `meta` table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+
+    /// Parse the stored string, if recognized.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label for the config modal.
+    pub fn label(self) -> &'static str {
+        match self {
+            Effort::Low => "Low",
+            Effort::Medium => "Medium",
+            Effort::High => "High",
+        }
+    }
+
+    /// Claude's `output_config.effort` value (its native named tiers).
+    pub fn claude_str(self) -> &'static str {
+        // Claude's own scale is low/medium/high/xhigh/max; we expose the lower
+        // three (its minimum up), which map through unchanged.
+        self.as_str()
+    }
+
+    /// Gemini `thinkingConfig.thinkingBudget` token budget. Values are chosen to
+    /// stay within the valid range of the common 2.5 models (Pro min 128,
+    /// Flash-Lite min 512, all ≤ 24576).
+    pub fn gemini_budget(self) -> i64 {
+        match self {
+            Effort::Low => 512,
+            Effort::Medium => 8192,
+            Effort::High => 24576,
+        }
+    }
+
+    /// All levels, in modal cycle order (low → high).
+    pub const ALL: [Effort; 3] = [Effort::Low, Effort::Medium, Effort::High];
 }
 
 /// A model backend that turns a prompt into text. Constructed on the synthesis
@@ -129,8 +200,10 @@ pub fn build_provider(
     kind: ProviderKind,
     model: &str,
     ollama_url: &str,
+    effort: Effort,
 ) -> Result<Box<dyn LlmProvider>, String> {
     match kind {
+        // Ollama has no reasoning-effort control, so `effort` is ignored.
         ProviderKind::Ollama => Ok(Box::new(ollama::OllamaProvider::new(
             ollama_url.to_string(),
             model.to_string(),
@@ -140,6 +213,7 @@ pub fn build_provider(
             Ok(Box::new(claude::ClaudeProvider::new(
                 key,
                 model.to_string(),
+                effort,
             )))
         }
         ProviderKind::Gemini => {
@@ -147,6 +221,7 @@ pub fn build_provider(
             Ok(Box::new(gemini::GeminiProvider::new(
                 key,
                 model.to_string(),
+                effort,
             )))
         }
     }
@@ -361,6 +436,23 @@ mod tests {
         }
         assert_eq!(ProviderKind::parse("anthropic"), Some(ProviderKind::Claude));
         assert_eq!(ProviderKind::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn effort_roundtrip() {
+        for effort in Effort::ALL {
+            assert_eq!(Effort::parse(effort.as_str()), Some(effort));
+        }
+        assert_eq!(Effort::parse("HIGH"), Some(Effort::High));
+        assert_eq!(Effort::parse("nonsense"), None);
+        assert_eq!(Effort::default(), Effort::Medium);
+    }
+
+    #[test]
+    fn only_hosted_backends_support_effort() {
+        assert!(!ProviderKind::Ollama.supports_effort());
+        assert!(ProviderKind::Claude.supports_effort());
+        assert!(ProviderKind::Gemini.supports_effort());
     }
 
     #[test]

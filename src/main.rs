@@ -45,7 +45,10 @@ fn build_semantic(store: &Store, notes: &[db::store::NoteRow]) -> Result<Semanti
 /// Resolve the active LLM provider and the per-provider models, applying
 /// precedence CLI override > stored DB value > built-in default. The CLI model
 /// override, if any, applies to the active provider only.
-fn resolve_llm_config(store: &Store, config: &Config) -> Result<(llm::ProviderKind, [String; 3])> {
+fn resolve_llm_config(
+    store: &Store,
+    config: &Config,
+) -> Result<(llm::ProviderKind, [String; 3], llm::Effort)> {
     use llm::ProviderKind;
 
     let provider = config
@@ -66,7 +69,10 @@ fn resolve_llm_config(store: &Store, config: &Config) -> Result<(llm::ProviderKi
             .or(store.llm_model(*kind)?)
             .unwrap_or_else(|| kind.default_model().to_string());
     }
-    Ok((provider, models))
+
+    // Effort has no CLI flag: stored value > built-in default.
+    let effort = store.llm_effort()?.unwrap_or_default();
+    Ok((provider, models, effort))
 }
 
 /// Send any chunks still lacking embeddings to the worker.
@@ -113,8 +119,8 @@ fn main() -> Result<()> {
     app.set_semantic(semantic);
 
     // Resolve the LLM config: CLI override > stored value > built-in default.
-    let (provider, llm_models) = resolve_llm_config(&store, &config)?;
-    app.set_llm_config(provider, llm_models);
+    let (provider, llm_models, llm_effort) = resolve_llm_config(&store, &config)?;
+    app.set_llm_config(provider, llm_models, llm_effort);
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app, &mut store, &config);
@@ -274,8 +280,8 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     if synthesis.is_some() {
                         app.set_status("A synthesis is already running…");
                     } else {
-                        let (provider, model) = app.llm_selection();
-                        match llm::build_provider(provider, &model, &config.ollama_url) {
+                        let (provider, model, effort) = app.llm_selection();
+                        match llm::build_provider(provider, &model, &config.ollama_url, effort) {
                             Ok(backend) => {
                                 let vault = config.vault.clone();
                                 let (tx, rx) = std::sync::mpsc::channel();
@@ -297,11 +303,12 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     }
                 }
                 Action::LlmConfigChanged => {
-                    let (provider, models) = app.llm_config_for_persist();
+                    let (provider, models, effort) = app.llm_config_for_persist();
                     store.set_llm_provider(provider)?;
                     for (kind, model) in &models {
                         store.set_llm_model(*kind, model)?;
                     }
+                    store.set_llm_effort(effort)?;
                 }
                 Action::RenameNote { path, new_slug } => {
                     let notes = store.all_notes()?;

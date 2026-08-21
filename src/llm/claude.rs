@@ -8,7 +8,7 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 
-use super::LlmProvider;
+use super::{Effort, LlmProvider};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -19,11 +19,16 @@ const MAX_TOKENS: u32 = 4096;
 pub struct ClaudeProvider {
     api_key: String,
     model: String,
+    effort: Effort,
 }
 
 impl ClaudeProvider {
-    pub fn new(api_key: String, model: String) -> Self {
-        ClaudeProvider { api_key, model }
+    pub fn new(api_key: String, model: String, effort: Effort) -> Self {
+        ClaudeProvider {
+            api_key,
+            model,
+            effort,
+        }
     }
 }
 
@@ -56,6 +61,7 @@ impl LlmProvider for ClaudeProvider {
             .json(&serde_json::json!({
                 "model": self.model,
                 "max_tokens": MAX_TOKENS,
+                "output_config": { "effort": self.effort.claude_str() },
                 "messages": [{ "role": "user", "content": prompt }],
             }))
             .send()

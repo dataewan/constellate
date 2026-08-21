@@ -8,7 +8,7 @@ use crate::config::RefFormat;
 use crate::db::store::NoteRow;
 use crate::embed::SemanticIndex;
 use crate::linking;
-use crate::llm::{self, ProviderKind, SynthesisRequest};
+use crate::llm::{self, Effort, ProviderKind, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::rename;
 use crate::ui::markdown;
@@ -102,10 +102,11 @@ struct LinkingState {
 }
 
 /// Rows in the LLM config modal.
-const CONFIG_ROWS: usize = 3;
+const CONFIG_ROWS: usize = 4;
 const CONFIG_ROW_PROVIDER: usize = 0;
 const CONFIG_ROW_MODEL: usize = 1;
-const CONFIG_ROW_PROMPTS: usize = 2;
+const CONFIG_ROW_EFFORT: usize = 2;
+const CONFIG_ROW_PROMPTS: usize = 3;
 
 /// State of the open LLM config modal.
 struct ConfigModal {
@@ -121,6 +122,9 @@ pub struct ConfigView {
     /// The model for the selected provider (the edit buffer while editing).
     pub model: String,
     pub editing_model: bool,
+    /// The reasoning-effort label for the active provider, or `None` when the
+    /// active provider (Ollama) has no effort control.
+    pub effort: Option<&'static str>,
     pub selected: usize,
     pub prompt_count: usize,
 }
@@ -205,6 +209,8 @@ pub struct App {
     llm_provider_idx: usize,
     /// The model for each provider, in `ProviderKind::ALL` order.
     llm_models: [String; 3],
+    /// Reasoning-effort level for hosted providers (Ollama ignores it).
+    llm_effort: Effort,
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
@@ -248,6 +254,7 @@ impl App {
                 ProviderKind::ALL[1].default_model().to_string(),
                 ProviderKind::ALL[2].default_model().to_string(),
             ],
+            llm_effort: Effort::default(),
             status: None,
         };
         app.refilter();
@@ -736,41 +743,50 @@ impl App {
 
     /// Install the resolved LLM provider selection and per-provider models
     /// (called once at startup, after reading CLI + DB config).
-    pub fn set_llm_config(&mut self, provider: ProviderKind, models: [String; 3]) {
+    pub fn set_llm_config(&mut self, provider: ProviderKind, models: [String; 3], effort: Effort) {
         self.llm_provider_idx = ProviderKind::ALL
             .iter()
             .position(|&k| k == provider)
             .unwrap_or(0);
         self.llm_models = models;
+        self.llm_effort = effort;
     }
 
-    /// The active provider and its model, for a synthesis run.
-    pub fn llm_selection(&self) -> (ProviderKind, String) {
+    /// The active provider, its model, and the effort level, for a synthesis run.
+    pub fn llm_selection(&self) -> (ProviderKind, String, Effort) {
         (
             ProviderKind::ALL[self.llm_provider_idx],
             self.llm_models[self.llm_provider_idx].clone(),
+            self.llm_effort,
         )
     }
 
-    /// The full config to persist: active provider plus every provider's model.
-    pub fn llm_config_for_persist(&self) -> (ProviderKind, [(ProviderKind, String); 3]) {
+    /// The full config to persist: active provider, every provider's model, and
+    /// the effort level.
+    pub fn llm_config_for_persist(&self) -> (ProviderKind, [(ProviderKind, String); 3], Effort) {
         let models = [
             (ProviderKind::ALL[0], self.llm_models[0].clone()),
             (ProviderKind::ALL[1], self.llm_models[1].clone()),
             (ProviderKind::ALL[2], self.llm_models[2].clone()),
         ];
-        (ProviderKind::ALL[self.llm_provider_idx], models)
+        (
+            ProviderKind::ALL[self.llm_provider_idx],
+            models,
+            self.llm_effort,
+        )
     }
 
     /// A read-only snapshot of the config modal, for rendering.
     pub fn config_view(&self) -> Option<ConfigView> {
+        let provider = ProviderKind::ALL[self.llm_provider_idx];
         self.config_modal.as_ref().map(|m| ConfigView {
-            provider_label: ProviderKind::ALL[self.llm_provider_idx].label(),
+            provider_label: provider.label(),
             model: m
                 .editing_model
                 .clone()
                 .unwrap_or_else(|| self.llm_models[self.llm_provider_idx].clone()),
             editing_model: m.editing_model.is_some(),
+            effort: provider.supports_effort().then(|| self.llm_effort.label()),
             selected: m.selected,
             prompt_count: llm::PROMPTS.len(),
         })
@@ -841,14 +857,30 @@ impl App {
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                 let selected = self.config_modal.as_ref().map(|m| m.selected);
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
                 if selected == Some(CONFIG_ROW_PROVIDER) {
-                    let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
                     self.llm_provider_idx = if forward {
                         (self.llm_provider_idx + 1) % ProviderKind::ALL.len()
                     } else {
                         (self.llm_provider_idx + ProviderKind::ALL.len() - 1)
                             % ProviderKind::ALL.len()
                     };
+                    return Action::LlmConfigChanged;
+                }
+                if selected == Some(CONFIG_ROW_EFFORT)
+                    && ProviderKind::ALL[self.llm_provider_idx].supports_effort()
+                {
+                    let idx = Effort::ALL
+                        .iter()
+                        .position(|&e| e == self.llm_effort)
+                        .unwrap_or(0);
+                    let len = Effort::ALL.len();
+                    let next = if forward {
+                        (idx + 1) % len
+                    } else {
+                        (idx + len - 1) % len
+                    };
+                    self.llm_effort = Effort::ALL[next];
                     return Action::LlmConfigChanged;
                 }
             }
