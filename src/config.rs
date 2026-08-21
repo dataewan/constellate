@@ -46,8 +46,10 @@ pub struct Config {
     pub embed_backend: Option<Backend>,
     /// Base URL of the Ollama server (for LLM synthesis).
     pub ollama_url: String,
-    /// Ollama chat model for scratchpad LLM synthesis.
-    pub llm_model: String,
+    /// LLM provider override from the CLI, if given (else the DB value / default).
+    pub llm_provider_cli: Option<String>,
+    /// Model override for the active provider from the CLI, if given.
+    pub llm_model_cli: Option<String>,
 }
 
 impl Config {
@@ -91,7 +93,8 @@ impl Config {
             ref_format: cli.ref_format,
             embed_backend,
             ollama_url: cli.ollama_url,
-            llm_model: cli.llm_model,
+            llm_provider_cli: cli.llm_provider,
+            llm_model_cli: cli.llm_model,
         })
     }
 }

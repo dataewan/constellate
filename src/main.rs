@@ -42,6 +42,39 @@ fn build_semantic(store: &Store, notes: &[db::store::NoteRow]) -> Result<Semanti
     Ok(SemanticIndex::build(notes, store.all_chunk_vectors()?))
 }
 
+/// Resolve the active LLM provider and the per-provider models, applying
+/// precedence CLI override > stored DB value > built-in default. The CLI model
+/// override, if any, applies to the active provider only.
+fn resolve_llm_config(
+    store: &Store,
+    config: &Config,
+) -> Result<(llm::ProviderKind, [String; 3], llm::Effort)> {
+    use llm::ProviderKind;
+
+    let provider = config
+        .llm_provider_cli
+        .as_deref()
+        .and_then(ProviderKind::parse)
+        .or(store.llm_provider()?)
+        .unwrap_or(ProviderKind::Ollama);
+
+    let mut models: [String; 3] = Default::default();
+    for (i, kind) in ProviderKind::ALL.iter().enumerate() {
+        let cli_override = if *kind == provider {
+            config.llm_model_cli.clone()
+        } else {
+            None
+        };
+        models[i] = cli_override
+            .or(store.llm_model(*kind)?)
+            .unwrap_or_else(|| kind.default_model().to_string());
+    }
+
+    // Effort has no CLI flag: stored value > built-in default.
+    let effort = store.llm_effort()?.unwrap_or_default();
+    Ok((provider, models, effort))
+}
+
 /// Send any chunks still lacking embeddings to the worker.
 fn submit_pending(store: &Store, worker: &Worker) -> Result<()> {
     let pending = store.chunks_without_embeddings()?;
@@ -84,6 +117,15 @@ fn main() -> Result<()> {
     let scratchpad = store.load_scratchpad()?;
     let mut app = App::new(config.vault.clone(), config.ref_format, notes, scratchpad);
     app.set_semantic(semantic);
+
+    // Resolve the LLM config: CLI override > stored value > built-in default.
+    let (provider, llm_models, llm_effort) = resolve_llm_config(&store, &config)?;
+    app.set_llm_config(provider, llm_models, llm_effort);
+
+    // Seed the prompt library from the built-in presets on first run, then load
+    // it (user edits persist across sessions).
+    store.seed_prompts()?;
+    app.set_prompts(store.load_prompts()?);
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app, &mut store, &config);
@@ -243,16 +285,51 @@ fn run(terminal: &mut Term, app: &mut App, store: &mut Store, config: &Config) -
                     if synthesis.is_some() {
                         app.set_status("A synthesis is already running…");
                     } else {
-                        let url = config.ollama_url.clone();
-                        let model = config.llm_model.clone();
-                        let vault = config.vault.clone();
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(llm::run_synthesis(&url, &model, &vault, &request));
-                        });
-                        synthesis = Some(rx);
-                        app.set_status(format!("Generating synthesis with {}…", config.llm_model));
+                        let (provider, model, effort) = app.llm_selection();
+                        match llm::build_provider(provider, &model, &config.ollama_url, effort) {
+                            Ok(backend) => {
+                                let vault = config.vault.clone();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(llm::run_synthesis(
+                                        backend.as_ref(),
+                                        &vault,
+                                        &request,
+                                    ));
+                                });
+                                synthesis = Some(rx);
+                                app.set_status(format!(
+                                    "Generating synthesis with {} ({model})…",
+                                    provider.label()
+                                ));
+                            }
+                            Err(err) => app.set_status(format!("LLM unavailable: {err}")),
+                        }
                     }
+                }
+                Action::LlmConfigChanged => {
+                    let (provider, models, effort) = app.llm_config_for_persist();
+                    store.set_llm_provider(provider)?;
+                    for (kind, model) in &models {
+                        store.set_llm_model(*kind, model)?;
+                    }
+                    store.set_llm_effort(effort)?;
+                }
+                Action::PromptAdd { label, text } => {
+                    store.add_prompt(&label, &text)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptUpdate { id, label, text } => {
+                    store.update_prompt(id, &label, &text)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptDelete { id } => {
+                    store.delete_prompt(id)?;
+                    app.set_prompts(store.load_prompts()?);
+                }
+                Action::PromptReorder { id_a, id_b } => {
+                    store.swap_prompt_positions(id_a, id_b)?;
+                    app.set_prompts(store.load_prompts()?);
                 }
                 Action::RenameNote { path, new_slug } => {
                     let notes = store.all_notes()?;

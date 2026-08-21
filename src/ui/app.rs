@@ -8,10 +8,11 @@ use crate::config::RefFormat;
 use crate::db::store::NoteRow;
 use crate::embed::SemanticIndex;
 use crate::linking;
-use crate::llm::{self, SynthesisRequest};
+use crate::llm::{self, Effort, ProviderKind, SynthesisRequest};
 use crate::related::{self, RelatedIndex, RelatedNote};
 use crate::rename;
 use crate::ui::markdown;
+use crate::ui::textinput::{InputView, TextInput};
 
 /// Which pane currently receives navigation keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,21 +56,51 @@ pub enum Action {
     /// Run an LLM synthesis over the scratchpad on a background thread.
     GenerateSynthesis(SynthesisRequest),
     /// Rename the active note's slug to `new_slug` (keeping its timestamp).
-    RenameNote { path: PathBuf, new_slug: String },
+    RenameNote {
+        path: PathBuf,
+        new_slug: String,
+    },
+    /// The LLM provider/model config changed and should be persisted.
+    LlmConfigChanged,
+    /// Add a new prompt to the library.
+    PromptAdd {
+        label: String,
+        text: String,
+    },
+    /// Update an existing prompt.
+    PromptUpdate {
+        id: i64,
+        label: String,
+        text: String,
+    },
+    /// Delete a prompt from the library.
+    PromptDelete {
+        id: i64,
+    },
+    /// Swap two prompts' positions (reorder).
+    PromptReorder {
+        id_a: i64,
+        id_b: i64,
+    },
 }
 
 /// The scratchpad → LLM prompt picker: choose a preset or enter a custom prompt.
 struct PromptPicker {
     /// 0..PROMPTS.len() selects a preset; the last row selects "Custom…".
     selected: usize,
-    /// `Some(text)` when in the custom free-text input mode.
-    custom: Option<String>,
+    /// `Some(input)` when in the custom free-text input mode.
+    custom: Option<TextInput>,
 }
 
 /// Read-only view of the prompt picker, for rendering the modal.
 pub enum PromptPickerView {
-    List { labels: Vec<String>, selected: usize },
-    Custom { text: String },
+    List {
+        labels: Vec<String>,
+        selected: usize,
+    },
+    Custom {
+        input: InputView,
+    },
 }
 
 /// A candidate pair of notes to offer a link between, during the linking flow.
@@ -91,20 +122,91 @@ struct LinkingState {
     modified: Vec<String>,
 }
 
+/// Rows in the LLM config modal.
+const CONFIG_ROWS: usize = 4;
+const CONFIG_ROW_PROVIDER: usize = 0;
+const CONFIG_ROW_MODEL: usize = 1;
+const CONFIG_ROW_EFFORT: usize = 2;
+const CONFIG_ROW_PROMPTS: usize = 3;
+
+/// State of the open LLM config modal.
+struct ConfigModal {
+    /// Highlighted row (0 provider, 1 model, 2 prompts).
+    selected: usize,
+    /// `Some(input)` while the model field is being edited.
+    editing_model: Option<TextInput>,
+}
+
+/// Which field of a prompt is being edited in the prompt-admin editor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptField {
+    Label,
+    Text,
+}
+
+/// An in-progress add/edit of a single prompt.
+struct PromptEdit {
+    /// `Some(id)` when editing an existing prompt; `None` when adding.
+    id: Option<i64>,
+    field: PromptField,
+    label: TextInput,
+    text: TextInput,
+}
+
+/// State of the open prompt-library manager (reached from the config modal).
+struct PromptAdmin {
+    /// Highlighted row in the prompt list.
+    selected: usize,
+    /// `Some` while adding or editing a prompt.
+    editing: Option<PromptEdit>,
+}
+
+/// Read-only snapshot of the prompt manager, for rendering.
+pub enum PromptAdminView {
+    /// Browsing the list: `(label, is_selected)` per row.
+    List {
+        prompts: Vec<String>,
+        selected: usize,
+    },
+    /// Editing/adding a prompt.
+    Edit {
+        adding: bool,
+        label: InputView,
+        text: InputView,
+        /// Whether the label field (true) or text field (false) is active.
+        editing_label: bool,
+    },
+}
+
+/// Read-only snapshot of the config modal, for rendering.
+pub struct ConfigView {
+    pub provider_label: &'static str,
+    /// The model for the selected provider when not editing.
+    pub model: String,
+    /// `Some` (with a cursor) while the model field is being edited.
+    pub model_input: Option<InputView>,
+    pub editing_model: bool,
+    /// The reasoning-effort label for the active provider, or `None` when the
+    /// active provider (Ollama) has no effort control.
+    pub effort: Option<&'static str>,
+    pub selected: usize,
+    pub prompt_count: usize,
+}
+
 /// An in-progress "rename this note" session: the note being renamed and the
 /// editable slug buffer (the timestamp prefix is fixed and not part of it).
 struct RenameState {
     path: PathBuf,
     prefix: String,
-    slug: String,
+    slug: TextInput,
 }
 
 /// Read-only snapshot of the rename modal, for rendering.
 pub struct RenamePrompt {
     /// The fixed `YYYYMMDDHHMM` prefix, shown before the editable slug.
     pub prefix: String,
-    /// The current editable slug text.
-    pub slug: String,
+    /// The current editable slug (with cursor).
+    pub slug: InputView,
 }
 
 /// Read-only snapshot of the current link prompt, for rendering the modal.
@@ -148,7 +250,7 @@ pub struct App {
     /// Whether the search input is capturing keystrokes.
     pub searching: bool,
     /// Current search query (also used as a persistent filter).
-    pub query: String,
+    query: TextInput,
     /// Selection state for the notes list widget.
     pub list_state: ListState,
     /// Selection state for the related-notes list widget.
@@ -165,6 +267,18 @@ pub struct App {
     prompt_picker: Option<PromptPicker>,
     /// In-progress rename-the-active-note session, if any.
     renaming: Option<RenameState>,
+    /// Open LLM config modal, if any.
+    config_modal: Option<ConfigModal>,
+    /// Open prompt-library manager, if any.
+    prompt_admin: Option<PromptAdmin>,
+    /// The synthesis prompt library, loaded from the DB.
+    prompts: Vec<llm::Prompt>,
+    /// Index into `ProviderKind::ALL` of the active provider.
+    llm_provider_idx: usize,
+    /// The model for each provider, in `ProviderKind::ALL` order.
+    llm_models: [String; 3],
+    /// Reasoning-effort level for hosted providers (Ollama ignores it).
+    llm_effort: Effort,
     /// Transient status-line message (e.g. a yank confirmation).
     pub status: Option<String>,
 }
@@ -192,7 +306,7 @@ impl App {
             preview_scroll: 0,
             related_selected: 0,
             searching: false,
-            query: String::new(),
+            query: TextInput::new(),
             list_state: ListState::default(),
             related_state: ListState::default(),
             scratchpad,
@@ -201,6 +315,16 @@ impl App {
             linking: None,
             prompt_picker: None,
             renaming: None,
+            config_modal: None,
+            prompt_admin: None,
+            prompts: Vec::new(),
+            llm_provider_idx: 0,
+            llm_models: [
+                ProviderKind::ALL[0].default_model().to_string(),
+                ProviderKind::ALL[1].default_model().to_string(),
+                ProviderKind::ALL[2].default_model().to_string(),
+            ],
+            llm_effort: Effort::default(),
             status: None,
         };
         app.refilter();
@@ -216,7 +340,11 @@ impl App {
         self.notes = notes;
         self.refilter();
         if let Some(path) = current {
-            if let Some(pos) = self.filtered.iter().position(|&i| self.notes[i].path == path) {
+            if let Some(pos) = self
+                .filtered
+                .iter()
+                .position(|&i| self.notes[i].path == path)
+            {
                 self.selected = pos;
                 self.sync_list_state();
             }
@@ -291,7 +419,10 @@ impl App {
     /// the anchor.
     pub fn active_note(&self) -> Option<&NoteRow> {
         let highlighted = match self.focus {
-            Focus::Related => self.related.get(self.related_selected).map(|r| r.path.as_str()),
+            Focus::Related => self
+                .related
+                .get(self.related_selected)
+                .map(|r| r.path.as_str()),
             Focus::Scratchpad => self
                 .scratchpad
                 .get(self.scratchpad_selected)
@@ -308,7 +439,8 @@ impl App {
 
     /// Path of the active note relative to the vault root, for display.
     pub fn current_relative_path(&self) -> Option<String> {
-        self.active_note().map(|note| self.relative_path(&note.path))
+        self.active_note()
+            .map(|note| self.relative_path(&note.path))
     }
 
     fn relative_path(&self, path: &str) -> String {
@@ -354,23 +486,24 @@ impl App {
         if self.renaming.is_some() {
             return self.handle_rename_key(key);
         }
+        if self.prompt_admin.is_some() {
+            return self.handle_prompt_admin_key(key);
+        }
+        if self.config_modal.is_some() {
+            return self.handle_config_key(key);
+        }
 
         if self.searching {
             match key.code {
                 // First Esc leaves the input but keeps the filter; a second Esc
                 // (handled below, in normal mode) clears it.
                 KeyCode::Esc | KeyCode::Enter => self.searching = false,
-                KeyCode::Backspace => {
-                    self.query.pop();
-                    self.refilter();
-                    self.select_note_changed();
+                _ => {
+                    if self.query.handle(key) {
+                        self.refilter();
+                        self.select_note_changed();
+                    }
                 }
-                KeyCode::Char(c) => {
-                    self.query.push(c);
-                    self.refilter();
-                    self.select_note_changed();
-                }
-                _ => {}
             }
             return Action::None;
         }
@@ -381,7 +514,7 @@ impl App {
             // the search input).
             KeyCode::Esc => {
                 if !self.query.is_empty() {
-                    self.query.clear();
+                    self.query = TextInput::new();
                     self.refilter();
                     self.select_note_changed();
                 }
@@ -416,6 +549,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.start_rename(),
+            KeyCode::Char('c') => self.open_config(),
             _ => {}
         }
         Action::None
@@ -602,7 +736,7 @@ impl App {
     pub fn rename_prompt(&self) -> Option<RenamePrompt> {
         self.renaming.as_ref().map(|state| RenamePrompt {
             prefix: state.prefix.clone(),
-            slug: state.slug.clone(),
+            slug: state.slug.view(),
         })
     }
 
@@ -625,7 +759,7 @@ impl App {
         self.renaming = Some(RenameState {
             path: PathBuf::from(path),
             prefix,
-            slug,
+            slug: TextInput::with_text(&slug),
         });
     }
 
@@ -633,21 +767,11 @@ impl App {
     fn handle_rename_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => self.renaming = None,
-            KeyCode::Backspace => {
-                if let Some(state) = self.renaming.as_mut() {
-                    state.slug.pop();
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(state) = self.renaming.as_mut() {
-                    state.slug.push(c);
-                }
-            }
             KeyCode::Enter => {
                 let Some(state) = self.renaming.take() else {
                     return Action::None;
                 };
-                let new_slug = state.slug.trim().to_string();
+                let new_slug = state.slug.text().trim().to_string();
                 if new_slug.is_empty() {
                     self.set_status("Rename cancelled — name was empty.");
                     return Action::None;
@@ -657,7 +781,11 @@ impl App {
                     new_slug,
                 };
             }
-            _ => {}
+            _ => {
+                if let Some(state) = self.renaming.as_mut() {
+                    state.slug.handle(key);
+                }
+            }
         }
         Action::None
     }
@@ -675,20 +803,215 @@ impl App {
         }
     }
 
-    /// A read-only snapshot of the prompt picker, for rendering.
-    pub fn prompt_picker_view(&self) -> Option<PromptPickerView> {
-        self.prompt_picker.as_ref().map(|picker| match &picker.custom {
-            Some(text) => PromptPickerView::Custom { text: text.clone() },
-            None => {
-                let mut labels: Vec<String> =
-                    llm::PROMPTS.iter().map(|(l, _)| (*l).to_string()).collect();
-                labels.push("Custom…".to_string());
-                PromptPickerView::List {
-                    labels,
-                    selected: picker.selected,
+    /// Install the resolved LLM provider selection and per-provider models
+    /// (called once at startup, after reading CLI + DB config).
+    pub fn set_llm_config(&mut self, provider: ProviderKind, models: [String; 3], effort: Effort) {
+        self.llm_provider_idx = ProviderKind::ALL
+            .iter()
+            .position(|&k| k == provider)
+            .unwrap_or(0);
+        self.llm_models = models;
+        self.llm_effort = effort;
+    }
+
+    /// The active provider, its model, and the effort level, for a synthesis run.
+    pub fn llm_selection(&self) -> (ProviderKind, String, Effort) {
+        (
+            ProviderKind::ALL[self.llm_provider_idx],
+            self.llm_models[self.llm_provider_idx].clone(),
+            self.llm_effort,
+        )
+    }
+
+    /// The full config to persist: active provider, every provider's model, and
+    /// the effort level.
+    pub fn llm_config_for_persist(&self) -> (ProviderKind, [(ProviderKind, String); 3], Effort) {
+        let models = [
+            (ProviderKind::ALL[0], self.llm_models[0].clone()),
+            (ProviderKind::ALL[1], self.llm_models[1].clone()),
+            (ProviderKind::ALL[2], self.llm_models[2].clone()),
+        ];
+        (
+            ProviderKind::ALL[self.llm_provider_idx],
+            models,
+            self.llm_effort,
+        )
+    }
+
+    /// A read-only snapshot of the config modal, for rendering.
+    pub fn config_view(&self) -> Option<ConfigView> {
+        let provider = ProviderKind::ALL[self.llm_provider_idx];
+        self.config_modal.as_ref().map(|m| ConfigView {
+            provider_label: provider.label(),
+            model: self.llm_models[self.llm_provider_idx].clone(),
+            model_input: m.editing_model.as_ref().map(|t| t.view()),
+            editing_model: m.editing_model.is_some(),
+            effort: provider.supports_effort().then(|| self.llm_effort.label()),
+            selected: m.selected,
+            prompt_count: self.prompts.len(),
+        })
+    }
+
+    /// Whether the search filter is non-empty.
+    pub fn query_is_empty(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// The current search text.
+    pub fn query_text(&self) -> String {
+        self.query.text()
+    }
+
+    /// A render snapshot of the search input (text + cursor).
+    pub fn query_view(&self) -> InputView {
+        self.query.view()
+    }
+
+    /// Install the prompt library loaded from the DB.
+    pub fn set_prompts(&mut self, prompts: Vec<llm::Prompt>) {
+        self.prompts = prompts;
+        if let Some(admin) = self.prompt_admin.as_mut() {
+            if admin.editing.is_none() {
+                admin.selected = admin.selected.min(self.prompts.len().saturating_sub(1));
+            }
+        }
+    }
+
+    /// Open the LLM config modal.
+    fn open_config(&mut self) {
+        self.config_modal = Some(ConfigModal {
+            selected: CONFIG_ROW_PROVIDER,
+            editing_model: None,
+        });
+    }
+
+    /// Handle a key while the config modal is open.
+    fn handle_config_key(&mut self, key: KeyEvent) -> Action {
+        // Editing the model text field captures all input.
+        let editing = self
+            .config_modal
+            .as_ref()
+            .is_some_and(|m| m.editing_model.is_some());
+        if editing {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(m) = self.config_modal.as_mut() {
+                        m.editing_model = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    let model = self
+                        .config_modal
+                        .as_ref()
+                        .and_then(|m| m.editing_model.as_ref())
+                        .map(|t| t.text().trim().to_string())
+                        .unwrap_or_default();
+                    if let Some(m) = self.config_modal.as_mut() {
+                        m.editing_model = None;
+                    }
+                    if !model.is_empty() {
+                        self.llm_models[self.llm_provider_idx] = model;
+                        return Action::LlmConfigChanged;
+                    }
+                }
+                _ => {
+                    if let Some(input) = self
+                        .config_modal
+                        .as_mut()
+                        .and_then(|m| m.editing_model.as_mut())
+                    {
+                        input.handle(key);
+                    }
                 }
             }
-        })
+            return Action::None;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.config_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(m) = self.config_modal.as_mut() {
+                    m.selected = (m.selected + CONFIG_ROWS - 1) % CONFIG_ROWS;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(m) = self.config_modal.as_mut() {
+                    m.selected = (m.selected + 1) % CONFIG_ROWS;
+                }
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                let selected = self.config_modal.as_ref().map(|m| m.selected);
+                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                if selected == Some(CONFIG_ROW_PROVIDER) {
+                    self.llm_provider_idx = if forward {
+                        (self.llm_provider_idx + 1) % ProviderKind::ALL.len()
+                    } else {
+                        (self.llm_provider_idx + ProviderKind::ALL.len() - 1)
+                            % ProviderKind::ALL.len()
+                    };
+                    return Action::LlmConfigChanged;
+                }
+                if selected == Some(CONFIG_ROW_EFFORT)
+                    && ProviderKind::ALL[self.llm_provider_idx].supports_effort()
+                {
+                    let idx = Effort::ALL
+                        .iter()
+                        .position(|&e| e == self.llm_effort)
+                        .unwrap_or(0);
+                    let len = Effort::ALL.len();
+                    let next = if forward {
+                        (idx + 1) % len
+                    } else {
+                        (idx + len - 1) % len
+                    };
+                    self.llm_effort = Effort::ALL[next];
+                    return Action::LlmConfigChanged;
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.config_modal.as_ref().map(|m| m.selected);
+                match selected {
+                    Some(CONFIG_ROW_MODEL) => {
+                        let current = self.llm_models[self.llm_provider_idx].clone();
+                        if let Some(m) = self.config_modal.as_mut() {
+                            m.editing_model = Some(TextInput::with_text(&current));
+                        }
+                    }
+                    Some(CONFIG_ROW_PROMPTS) => {
+                        // Hand off to the prompt-library manager, closing the
+                        // config modal so only one overlay is active.
+                        self.config_modal = None;
+                        self.prompt_admin = Some(PromptAdmin {
+                            selected: 0,
+                            editing: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// A read-only snapshot of the prompt picker, for rendering.
+    pub fn prompt_picker_view(&self) -> Option<PromptPickerView> {
+        self.prompt_picker
+            .as_ref()
+            .map(|picker| match &picker.custom {
+                Some(input) => PromptPickerView::Custom {
+                    input: input.view(),
+                },
+                None => {
+                    let mut labels: Vec<String> =
+                        self.prompts.iter().map(|p| p.label.clone()).collect();
+                    labels.push("Custom…".to_string());
+                    PromptPickerView::List {
+                        labels,
+                        selected: picker.selected,
+                    }
+                }
+            })
     }
 
     /// Open the prompt picker for LLM synthesis over the scratchpad.
@@ -721,29 +1044,23 @@ impl App {
                     let text = self
                         .prompt_picker
                         .as_ref()
-                        .and_then(|p| p.custom.clone())
+                        .and_then(|p| p.custom.as_ref())
+                        .map(|t| t.text().trim().to_string())
                         .unwrap_or_default();
-                    let text = text.trim().to_string();
                     if !text.is_empty() {
                         return self.confirm_synthesis(&text);
                     }
                 }
-                KeyCode::Backspace => {
+                _ => {
                     if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
-                        t.pop();
+                        t.handle(key);
                     }
                 }
-                KeyCode::Char(c) => {
-                    if let Some(t) = self.prompt_picker.as_mut().and_then(|p| p.custom.as_mut()) {
-                        t.push(c);
-                    }
-                }
-                _ => {}
             }
             return Action::None;
         }
 
-        let count = llm::PROMPTS.len();
+        let count = self.prompts.len();
         match key.code {
             KeyCode::Esc => self.prompt_picker = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -760,18 +1077,18 @@ impl App {
                 let selected = self.prompt_picker.as_ref().map(|p| p.selected).unwrap_or(0);
                 if selected >= count {
                     if let Some(p) = self.prompt_picker.as_mut() {
-                        p.custom = Some(String::new());
+                        p.custom = Some(TextInput::new());
                     }
                 } else {
-                    let (_label, text) = llm::PROMPTS[selected];
-                    return self.confirm_synthesis(text);
+                    let text = self.prompts[selected].text.clone();
+                    return self.confirm_synthesis(&text);
                 }
             }
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = c as usize - '1' as usize;
                 if idx < count {
-                    let (_label, text) = llm::PROMPTS[idx];
-                    return self.confirm_synthesis(text);
+                    let text = self.prompts[idx].text.clone();
+                    return self.confirm_synthesis(&text);
                 }
             }
             _ => {}
@@ -800,6 +1117,158 @@ impl App {
             prompt_text: prompt_text.to_string(),
             sources,
         })
+    }
+
+    /// A read-only snapshot of the prompt manager, for rendering.
+    pub fn prompt_admin_view(&self) -> Option<PromptAdminView> {
+        self.prompt_admin
+            .as_ref()
+            .map(|admin| match &admin.editing {
+                Some(edit) => PromptAdminView::Edit {
+                    adding: edit.id.is_none(),
+                    label: edit.label.view(),
+                    text: edit.text.view(),
+                    editing_label: edit.field == PromptField::Label,
+                },
+                None => PromptAdminView::List {
+                    prompts: self.prompts.iter().map(|p| p.label.clone()).collect(),
+                    selected: admin.selected,
+                },
+            })
+    }
+
+    /// Handle a key while the prompt-library manager is open.
+    fn handle_prompt_admin_key(&mut self, key: KeyEvent) -> Action {
+        // Editing/adding a prompt captures all input.
+        if self
+            .prompt_admin
+            .as_ref()
+            .is_some_and(|a| a.editing.is_some())
+        {
+            return self.handle_prompt_edit_key(key);
+        }
+
+        let count = self.prompts.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.prompt_admin = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    if count > 0 {
+                        a.selected = (a.selected + count - 1) % count;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    if count > 0 {
+                        a.selected = (a.selected + 1) % count;
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    a.editing = Some(PromptEdit {
+                        id: None,
+                        field: PromptField::Label,
+                        label: TextInput::new(),
+                        text: TextInput::new(),
+                    });
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if let Some(prompt) = self.prompts.get(sel).cloned() {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.editing = Some(PromptEdit {
+                            id: Some(prompt.id),
+                            field: PromptField::Label,
+                            label: TextInput::with_text(&prompt.label),
+                            text: TextInput::with_text(&prompt.text),
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if let Some(prompt) = self.prompts.get(sel) {
+                    return Action::PromptDelete { id: prompt.id };
+                }
+            }
+            // Shift+J / Shift+K reorder the selected prompt down / up.
+            KeyCode::Char('J') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if sel + 1 < count {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.selected = sel + 1;
+                    }
+                    return Action::PromptReorder {
+                        id_a: self.prompts[sel].id,
+                        id_b: self.prompts[sel + 1].id,
+                    };
+                }
+            }
+            KeyCode::Char('K') => {
+                let sel = self.prompt_admin.as_ref().map(|a| a.selected).unwrap_or(0);
+                if sel > 0 && sel < count {
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.selected = sel - 1;
+                    }
+                    return Action::PromptReorder {
+                        id_a: self.prompts[sel].id,
+                        id_b: self.prompts[sel - 1].id,
+                    };
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Handle a key while adding/editing a single prompt.
+    fn handle_prompt_edit_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(a) = self.prompt_admin.as_mut() {
+                    a.editing = None;
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
+                    edit.field = match edit.field {
+                        PromptField::Label => PromptField::Text,
+                        PromptField::Text => PromptField::Label,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                // Save. Both fields must be non-empty.
+                if let Some(edit) = self.prompt_admin.as_ref().and_then(|a| a.editing.as_ref()) {
+                    let label = edit.label.text().trim().to_string();
+                    let text = edit.text.text().trim().to_string();
+                    let id = edit.id;
+                    if label.is_empty() || text.is_empty() {
+                        self.set_status("A prompt needs both a label and text.");
+                        return Action::None;
+                    }
+                    if let Some(a) = self.prompt_admin.as_mut() {
+                        a.editing = None;
+                    }
+                    return match id {
+                        Some(id) => Action::PromptUpdate { id, label, text },
+                        None => Action::PromptAdd { label, text },
+                    };
+                }
+            }
+            _ => {
+                if let Some(edit) = self.prompt_admin.as_mut().and_then(|a| a.editing.as_mut()) {
+                    match edit.field {
+                        PromptField::Label => edit.label.handle(key),
+                        PromptField::Text => edit.text.handle(key),
+                    };
+                }
+            }
+        }
+        Action::None
     }
 
     /// Enter does something different depending on the focused pane.
@@ -895,7 +1364,11 @@ impl App {
 
     /// Make the highlighted related note the current note.
     fn jump_to_related(&mut self) {
-        if let Some(target) = self.related.get(self.related_selected).map(|r| r.path.clone()) {
+        if let Some(target) = self
+            .related
+            .get(self.related_selected)
+            .map(|r| r.path.clone())
+        {
             self.jump_to_path(&target);
         }
     }
@@ -912,11 +1385,15 @@ impl App {
         }
         // If the target is filtered out, clear the search so it is reachable.
         if !self.filtered.iter().any(|&i| self.notes[i].path == path) {
-            self.query.clear();
+            self.query = TextInput::new();
             self.searching = false;
             self.refilter();
         }
-        if let Some(pos) = self.filtered.iter().position(|&i| self.notes[i].path == path) {
+        if let Some(pos) = self
+            .filtered
+            .iter()
+            .position(|&i| self.notes[i].path == path)
+        {
             self.selected = pos;
             self.sync_list_state();
         }
@@ -925,7 +1402,7 @@ impl App {
     }
 
     fn refilter(&mut self) {
-        let query = self.query.to_lowercase();
+        let query = self.query.text().to_lowercase();
         self.filtered = self
             .notes
             .iter()
